@@ -62,6 +62,12 @@ class JkBmsBleService : Service() {
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
 
+    @Volatile
+    private var isGattConnected = false
+    @Volatile
+    private var lastConnectAttemptMillis = 0L
+    private var lastNotificationUpdateMillis = 0L
+
     private val rxBuffer = ByteArrayOutputStream()
     private var lastAlertTimeMillis = 0L
 
@@ -79,8 +85,11 @@ class JkBmsBleService : Service() {
             ACTION_PAUSE_FOR_JK_APP -> {
                 pauseConnectionForOfficialApp()
             }
-            ACTION_RESUME, ACTION_RECONNECT, ACTION_START -> {
-                resumeAndConnect()
+            ACTION_RESUME, ACTION_START -> {
+                resumeAndConnect(forceReconnect = false)
+            }
+            ACTION_RECONNECT -> {
+                resumeAndConnect(forceReconnect = true)
             }
             ACTION_STOP -> {
                 disconnectGatt()
@@ -103,7 +112,7 @@ class JkBmsBleService : Service() {
         )
     }
 
-    private fun resumeAndConnect() {
+    private fun resumeAndConnect(forceReconnect: Boolean) {
         val prefs = AppPrefs(this)
         val mac = prefs.targetMacAddress
         val name = prefs.targetDeviceName
@@ -118,12 +127,22 @@ class JkBmsBleService : Service() {
             return
         }
 
+        val current = _stateFlow.value
+        val alreadyConnectedToSame = isGattConnected &&
+            bluetoothGatt != null &&
+            !current.paused &&
+            current.deviceAddress == mac
+
+        if (alreadyConnectedToSame && !forceReconnect) {
+            return
+        }
+
         updateState(
-            _stateFlow.value.copy(
+            current.copy(
                 paused = false,
                 deviceName = name,
                 deviceAddress = mac,
-                statusText = if (_stateFlow.value.connected) "Подключено" else "Подключение к $name..."
+                statusText = if (current.connected && !forceReconnect) "Подключено" else "Подключение к $name..."
             )
         )
         connectToDevice(mac)
@@ -132,29 +151,23 @@ class JkBmsBleService : Service() {
     private fun startPollingLoop() {
         pollJob?.cancel()
         pollJob = serviceScope.launch {
-            var tick = 0
             while (isActive) {
                 val st = _stateFlow.value
                 val prefs = AppPrefs(this@JkBmsBleService)
+                val now = System.currentTimeMillis()
                 if (!st.paused && prefs.targetMacAddress.isNotBlank()) {
-                    if (!st.connected || bluetoothGatt == null) {
+                    if (bluetoothGatt == null || (!isGattConnected && now - lastConnectAttemptMillis > 10_000L)) {
                         connectToDevice(prefs.targetMacAddress)
-                        delay(5000)
-                        continue
-                    } else {
-                        // Каждые 4 секунды запрашиваем свежий кадр телеметрии 0x96
-                        sendCommand(JkBmsParser.buildCellInfoCommand())
-                        // Если данных не было более 18 секунд — переподключаемся
-                        if (st.lastUpdatedMillis > 0 &&
-                            System.currentTimeMillis() - st.lastUpdatedMillis > 18_000L &&
-                            tick % 4 == 0
-                        ) {
-                            connectToDevice(prefs.targetMacAddress)
-                        }
+                    } else if (isGattConnected &&
+                        st.lastUpdatedMillis > 0 &&
+                        now - st.lastUpdatedMillis > 25_000L &&
+                        now - lastConnectAttemptMillis > 25_000L
+                    ) {
+                        // Переподключаемся только если поток уведомлений от BMS полностью завис (>25 сек)
+                        connectToDevice(prefs.targetMacAddress)
                     }
                 }
-                tick++
-                delay(4000)
+                delay(5000)
             }
         }
     }
@@ -170,6 +183,7 @@ class JkBmsBleService : Service() {
             }
 
             disconnectGatt()
+            lastConnectAttemptMillis = System.currentTimeMillis()
             val device: BluetoothDevice = adapter.getRemoteDevice(macAddress)
             bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -188,6 +202,7 @@ class JkBmsBleService : Service() {
             bluetoothGatt?.close()
         } catch (_: Exception) {
         } finally {
+            isGattConnected = false
             bluetoothGatt = null
             writeCharacteristic = null
             rxBuffer.reset()
@@ -197,9 +212,19 @@ class JkBmsBleService : Service() {
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                isGattConnected = true
+                lastConnectAttemptMillis = System.currentTimeMillis()
                 updateState(_stateFlow.value.copy(statusText = "Обнаружение сервисов JK BMS..."))
                 gatt.requestMtu(512)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                isGattConnected = false
+                try {
+                    gatt.close()
+                } catch (_: Exception) {
+                }
+                if (bluetoothGatt === gatt) {
+                    bluetoothGatt = null
+                }
                 val isPaused = _stateFlow.value.paused
                 updateState(
                     _stateFlow.value.copy(
@@ -323,9 +348,17 @@ class JkBmsBleService : Service() {
     }
 
     private fun updateState(newState: JkBmsState) {
+        val prev = _stateFlow.value
         _stateFlow.value = newState
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIF_ID_MONITOR, buildShadeNotification(newState))
+        val now = System.currentTimeMillis()
+        val statusChanged = prev.connected != newState.connected ||
+            prev.paused != newState.paused ||
+            prev.statusText != newState.statusText
+        if (statusChanged || now - lastNotificationUpdateMillis >= 1500L) {
+            lastNotificationUpdateMillis = now
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIF_ID_MONITOR, buildShadeNotification(newState))
+        }
     }
 
     private fun checkOptionalAlerts(state: JkBmsState) {
