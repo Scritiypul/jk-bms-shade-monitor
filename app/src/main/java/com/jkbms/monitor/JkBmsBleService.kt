@@ -29,7 +29,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.util.Locale
 import java.util.UUID
 
@@ -55,12 +63,41 @@ class JkBmsBleService : Service() {
 
         private val _stateFlow = MutableStateFlow(JkBmsState())
         val stateFlow: StateFlow<JkBmsState> = _stateFlow
+
+        const val WIFI_UDP_PORT = 48888
+        const val WIFI_HTTP_PORT = 48889
+
+        fun getLocalWifiIp(): String {
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces() ?: return ""
+                while (interfaces.hasMoreElements()) {
+                    val nif = interfaces.nextElement()
+                    if (!nif.isUp || nif.isLoopback) continue
+                    val addrs = nif.inetAddresses
+                    while (addrs.hasMoreElements()) {
+                        val addr = addrs.nextElement()
+                        if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                            val ip = addr.hostAddress ?: ""
+                            if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
+                                return ip
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            return ""
+        }
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollJob: Job? = null
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var httpServerSocket: ServerSocket? = null
+    private var udpDiscoverySocket: DatagramSocket? = null
+    @Volatile
+    private var lastKnownPcAddress: InetAddress? = null
 
     @Volatile
     private var isGattConnected = false
@@ -78,6 +115,7 @@ class JkBmsBleService : Service() {
         createNotificationChannels()
         startForeground(NOTIF_ID_MONITOR, buildShadeNotification(_stateFlow.value))
         startPollingLoop()
+        startWifiBridge()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -512,8 +550,125 @@ class JkBmsBleService : Service() {
         }
     }
 
+    private fun stateToJson(st: JkBmsState): String {
+        val obj = JSONObject()
+        obj.put("connected", st.connected)
+        obj.put("paused", st.paused)
+        obj.put("statusText", st.statusText)
+        obj.put("deviceName", st.deviceName)
+        obj.put("deviceAddress", st.deviceAddress)
+        obj.put("socPercent", st.socPercent)
+        obj.put("packVoltage", st.packVoltage)
+        obj.put("currentAmps", st.currentAmps)
+        obj.put("powerWatts", st.powerWatts)
+        obj.put("chargeWatts", st.chargeWatts)
+        obj.put("dischargeWatts", st.dischargeWatts)
+        obj.put("remainingCapacityAh", st.remainingCapacityAh)
+        obj.put("nominalCapacityAh", st.nominalCapacityAh)
+        obj.put("remainingEnergyWh", st.remainingEnergyWh)
+        obj.put("tempMos", st.tempMos)
+        obj.put("tempSensor1", st.tempSensor1)
+        obj.put("tempSensor2", st.tempSensor2)
+        obj.put("cellDeltaMv", st.cellDeltaMv)
+        obj.put("cycleCount", st.cycleCount)
+        obj.put("lastUpdatedMillis", st.lastUpdatedMillis)
+        obj.put("phoneIp", getLocalWifiIp())
+
+        val arr = JSONArray()
+        for (v in st.cellVoltages) {
+            arr.put(v)
+        }
+        obj.put("cellVoltages", arr)
+        return obj.toString()
+    }
+
+    private fun startWifiBridge() {
+        // 1. Периодическая UDP-рассылка состояния в локальную Wi-Fi сеть (порт 48888)
+        serviceScope.launch {
+            var sock: DatagramSocket? = null
+            try {
+                sock = DatagramSocket()
+                sock.broadcast = true
+                while (isActive) {
+                    try {
+                        val payload = stateToJson(_stateFlow.value).toByteArray(Charsets.UTF_8)
+                        val globalBcast = InetAddress.getByName("255.255.255.255")
+                        sock.send(DatagramPacket(payload, payload.size, globalBcast, WIFI_UDP_PORT))
+
+                        val localIp = getLocalWifiIp()
+                        if (localIp.isNotEmpty() && localIp.contains(".")) {
+                            val subnetBcast = localIp.substringBeforeLast(".") + ".255"
+                            sock.send(DatagramPacket(payload, payload.size, InetAddress.getByName(subnetBcast), WIFI_UDP_PORT))
+                        }
+
+                        val pcAddr = lastKnownPcAddress
+                        if (pcAddr != null) {
+                            sock.send(DatagramPacket(payload, payload.size, pcAddr, WIFI_UDP_PORT))
+                        }
+                    } catch (_: Exception) {
+                    }
+                    delay(1500)
+                }
+            } catch (_: Exception) {
+            } finally {
+                try { sock?.close() } catch (_: Exception) {}
+            }
+        }
+
+        // 2. UDP-слушатель запросов обнаружения от ПК на порту 48889
+        serviceScope.launch {
+            try {
+                val ds = DatagramSocket(WIFI_HTTP_PORT)
+                udpDiscoverySocket = ds
+                val buf = ByteArray(256)
+                while (isActive) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    ds.receive(pkt)
+                    lastKnownPcAddress = pkt.address
+                    val payload = stateToJson(_stateFlow.value).toByteArray(Charsets.UTF_8)
+                    ds.send(DatagramPacket(payload, payload.size, pkt.address, WIFI_UDP_PORT))
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        // 3. HTTP-сервер на порту 48889 (http://<IP-телефона>:48889/status)
+        serviceScope.launch {
+            try {
+                val server = ServerSocket(WIFI_HTTP_PORT)
+                httpServerSocket = server
+                while (isActive) {
+                    val client = server.accept()
+                    lastKnownPcAddress = client.inetAddress
+                    serviceScope.launch {
+                        try {
+                            client.soTimeout = 2000
+                            val json = stateToJson(_stateFlow.value)
+                            val bodyBytes = json.toByteArray(Charsets.UTF_8)
+                            val headers = "HTTP/1.1 200 OK\r\n" +
+                                "Content-Type: application/json; charset=utf-8\r\n" +
+                                "Content-Length: ${bodyBytes.size}\r\n" +
+                                "Access-Control-Allow-Origin: *\r\n" +
+                                "Connection: close\r\n\r\n"
+                            val out = client.getOutputStream()
+                            out.write(headers.toByteArray(Charsets.UTF_8))
+                            out.write(bodyBytes)
+                            out.flush()
+                        } catch (_: Exception) {
+                        } finally {
+                            try { client.close() } catch (_: Exception) {}
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     override fun onDestroy() {
         pollJob?.cancel()
+        try { httpServerSocket?.close() } catch (_: Exception) {}
+        try { udpDiscoverySocket?.close() } catch (_: Exception) {}
         serviceScope.cancel()
         disconnectGatt()
         super.onDestroy()

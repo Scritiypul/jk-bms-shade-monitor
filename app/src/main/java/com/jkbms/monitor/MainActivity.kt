@@ -419,8 +419,12 @@ class MainActivity : AppCompatActivity() {
     private fun renderState(state: JkBmsState) {
         val savedName = prefs.targetDeviceName.ifBlank { state.deviceName }
         val savedMac = prefs.targetMacAddress.ifBlank { state.deviceAddress }
+        val wifiIp = JkBmsBleService.getLocalWifiIp()
+        val wifiNote = if (wifiIp.isNotEmpty()) "\n📡 Трансляция на ПК (Wi-Fi): $wifiIp:${JkBmsBleService.WIFI_HTTP_PORT}" else ""
         if (savedMac.isNotBlank()) {
-            tvDeviceSubtitle.text = "Устройство: $savedName ($savedMac)"
+            tvDeviceSubtitle.text = "Устройство: $savedName ($savedMac)$wifiNote"
+        } else if (wifiNote.isNotEmpty()) {
+            tvDeviceSubtitle.text = "Нажмите «Найти JK BMS», чтобы привязать плату$wifiNote"
         }
 
         val timeStr = if (state.lastUpdatedMillis > 0) {
