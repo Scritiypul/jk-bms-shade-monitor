@@ -805,12 +805,27 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(etCloudId)
 
+        // Переключатель постоянной панели в шторке уведомлений Android
+        val swShade = Switch(this).apply {
+            text = "📲 Показывать сводку в шторке уведомлений"
+            setTextColor(Color.WHITE)
+            isChecked = prefs.shadeNotificationEnabled
+            setPadding(0, dp(12), 0, dp(6))
+            setOnCheckedChangeListener { _, checked ->
+                prefs.shadeNotificationEnabled = checked
+                startMonitorService(JkBmsBleService.ACTION_UPDATE_SHADE)
+                val msg = if (checked) "Шторка включена" else "Шторка отключена"
+                Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+            }
+        }
+        container.addView(swShade)
+
         // Оповещения
         val swAlerts = Switch(this).apply {
             text = "🔔 Звуковые уведомления (низкий заряд / перегрев)"
             setTextColor(Color.WHITE)
             isChecked = prefs.alertsEnabled
-            setPadding(0, dp(10), 0, dp(6))
+            setPadding(0, dp(6), 0, dp(6))
             setOnCheckedChangeListener { _, checked -> prefs.alertsEnabled = checked }
         }
         container.addView(swAlerts)

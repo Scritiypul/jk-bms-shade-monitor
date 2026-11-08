@@ -285,10 +285,10 @@ void sendJKCommand(uint8_t reg, uint32_t val, uint8_t len) {
   targetChar->writeValue(cmd, 20, false);
 }
 
-// Постановка команды управления BMS в очередь
+// Постановка команды управления BMS в очередь (протокол JK02 BLE: 0x1D = Charge, 0x1E = Discharge, 0x1F = Balance)
 bool queueBMSControl(const String& cmdName, int val) {
   if (cmdName == "chg") {
-    pendingCmdReg = 0xAB; // Ключ Заряда (Charge MOS)
+    pendingCmdReg = 0x1D; // Ключ Заряда (Charge MOS по BLE)
     pendingCmdVal = (val != 0) ? 1 : 0;
     hasPendingCmd = true;
     portENTER_CRITICAL(&bmsMux);
@@ -296,7 +296,7 @@ bool queueBMSControl(const String& cmdName, int val) {
     portEXIT_CRITICAL(&bmsMux);
     return true;
   } else if (cmdName == "dsg") {
-    pendingCmdReg = 0xAC; // Ключ Разряда (Discharge MOS)
+    pendingCmdReg = 0x1E; // Ключ Разряда (Discharge MOS по BLE)
     pendingCmdVal = (val != 0) ? 1 : 0;
     hasPendingCmd = true;
     portENTER_CRITICAL(&bmsMux);
@@ -304,7 +304,7 @@ bool queueBMSControl(const String& cmdName, int val) {
     portEXIT_CRITICAL(&bmsMux);
     return true;
   } else if (cmdName == "bal") {
-    pendingCmdReg = 0xAD; // Балансировка (Balancer)
+    pendingCmdReg = 0x1F; // Балансировка (Balancer по BLE)
     pendingCmdVal = (val != 0) ? 1 : 0;
     hasPendingCmd = true;
     portENTER_CRITICAL(&bmsMux);
@@ -948,11 +948,12 @@ void bleTask(void* parameter) {
         if (reg == 0x96) {
           sendJKCommand(0x96, 0, 0);
         } else {
+          Serial.printf("[BLE CMD] Запись регистра 0x%02X = %u\n", reg, (unsigned int)val);
           sendJKCommand(reg, val, 4);
-          vTaskDelay(pdMS_TO_TICKS(300));
+          vTaskDelay(pdMS_TO_TICKS(350));
           sendJKCommand(0x96, 0, 0);
         }
-        lastParsedMs = millis();
+        lastParsedMs = 0;
       }
 
       if (millis() - lastParsedMs > 25000) {

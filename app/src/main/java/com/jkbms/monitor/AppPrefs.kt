@@ -6,12 +6,12 @@ class AppPrefs(context: Context) {
     private val prefs = context.getSharedPreferences("jk_bms_prefs", Context.MODE_PRIVATE)
 
     var targetMacAddress: String
-        get() = prefs.getString("target_mac", "") ?: ""
-        set(value) = prefs.edit().putString("target_mac", value).apply()
+        get() = prefs.getString("target_mac", "C8:47:80:55:04:85") ?: "C8:47:80:55:04:85"
+        set(value) = prefs.edit().putString("target_mac", value.trim()).apply()
 
     var targetDeviceName: String
-        get() = prefs.getString("target_name", "") ?: ""
-        set(value) = prefs.edit().putString("target_name", value).apply()
+        get() = prefs.getString("target_name", "JK-B2A8S20P") ?: "JK-B2A8S20P"
+        set(value) = prefs.edit().putString("target_name", value.trim()).apply()
 
     var esp32Host: String
         get() = prefs.getString("esp32_host", "192.168.123.105") ?: "192.168.123.105"
@@ -28,6 +28,10 @@ class AppPrefs(context: Context) {
     var useDirectBle: Boolean
         get() = prefs.getBoolean("use_direct_ble", false)
         set(value) = prefs.edit().putBoolean("use_direct_ble", value).apply()
+
+    var shadeNotificationEnabled: Boolean
+        get() = prefs.getBoolean("shade_notif_enabled", true)
+        set(value) = prefs.edit().putBoolean("shade_notif_enabled", value).apply()
 
     var alertsEnabled: Boolean
         get() = prefs.getBoolean("alerts_enabled", false)

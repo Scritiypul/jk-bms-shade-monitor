@@ -42,6 +42,7 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.UUID
+import javax.net.ssl.SSLSocketFactory
 
 @SuppressLint("MissingPermission")
 class JkBmsBleService : Service() {
@@ -52,6 +53,7 @@ class JkBmsBleService : Service() {
         const val ACTION_RESUME = "com.jkbms.monitor.ACTION_RESUME"
         const val ACTION_STOP = "com.jkbms.monitor.ACTION_STOP"
         const val ACTION_RECONNECT = "com.jkbms.monitor.ACTION_RECONNECT"
+        const val ACTION_UPDATE_SHADE = "com.jkbms.monitor.ACTION_UPDATE_SHADE"
 
         private const val CHANNEL_ID_MONITOR = "jk_bms_live_shade"
         private const val CHANNEL_ID_ALERTS = "jk_bms_alerts"
@@ -59,7 +61,8 @@ class JkBmsBleService : Service() {
         private const val NOTIF_ID_ALERT = 1002
 
         const val MQTT_BROKER_HOST = "broker.emqx.io"
-        const val MQTT_BROKER_PORT = 1883
+        const val MQTT_BROKER_PORT_TCP = 1883
+        const val MQTT_BROKER_PORT_TLS = 8883
 
         val SERVICE_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
         val CHAR_NOTIFY_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
@@ -68,6 +71,9 @@ class JkBmsBleService : Service() {
 
         private val _stateFlow = MutableStateFlow(JkBmsState())
         val stateFlow: StateFlow<JkBmsState> = _stateFlow
+
+        @Volatile
+        private var activeInstance: JkBmsBleService? = null
 
         fun getLocalWifiIp(): String {
             try {
@@ -92,9 +98,12 @@ class JkBmsBleService : Service() {
         }
 
         /**
-         * Отправка команды управления в BMS:
-         * 1. Пробует локальный HTTP-запрос к ESP32 (/control), если телефон в домашней Wi-Fi сети
-         * 2. Одновременно отправляет команду через облачный брокер MQTT (работает из любой точки мира по 4G/5G/Wi-Fi!)
+         * Отправка команды управления в BMS (0x1D Заряд, 0x1E Разряд, 0x1F Балансир):
+         * 1. Если включен прямой Bluetooth BLE к BMS — шлет команду напрямую по BLE.
+         * 2. Если телефон дома в Wi-Fi — шлет HTTP GET на http://192.168.123.105/control и проверяет JSON-ответ {"ok":true}.
+         *    (Если ESP32 отвечает редиректом на /, предупреждает, что в ESP32 еще не залита прошивка v2.0!).
+         * 3. Если вне дома (мобильный интернет 4G/5G или чужой Wi-Fi) — шлет через MQTT с авто-переключением
+         *    на защищенный порт TLS 8883 (который не блокируется мобильными операторами).
          */
         suspend fun sendGatewayControlCommand(
             context: Context,
@@ -106,23 +115,48 @@ class JkBmsBleService : Service() {
             val host = prefs.esp32Host.ifBlank { "192.168.123.105" }
             val topicId = prefs.cloudTopicId.ifBlank { "c84780550485" }
 
+            // 0. Если активно прямое BLE-соединение с телефона на BMS
+            val svc = activeInstance
+            if (prefs.useDirectBle && svc != null && svc.isGattConnected) {
+                val regByte: Byte? = when (cmd) {
+                    "chg" -> 0x1D.toByte()
+                    "dsg" -> 0x1E.toByte()
+                    "bal" -> 0x1F.toByte()
+                    else -> null
+                }
+                if (regByte != null) {
+                    svc.sendBleControlRegister(regByte, value)
+                    return@withContext Pair(true, "✅ Команда отправлена напрямую по Bluetooth BLE")
+                }
+            }
+
             var localHttpOk = false
             var localHttpError = ""
+            var espOldFirmwareDetected = false
 
-            // 1. Попытка через локальный HTTP (быстро, если дома)
+            // 1. Попытка через локальный HTTP (быстро, если телефон в домашнем Wi-Fi)
             try {
                 val encPin = URLEncoder.encode(pin, "UTF-8")
                 val url = URL("http://$host/control?pin=$encPin&cmd=$cmd&val=$value")
                 val conn = (url.openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 1500
-                    readTimeout = 1500
+                    instanceFollowRedirects = false
+                    connectTimeout = 1800
+                    readTimeout = 1800
                     requestMethod = "GET"
                 }
                 val code = conn.responseCode
                 if (code == 200) {
-                    localHttpOk = true
+                    val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                    if (body.contains("\"ok\":true")) {
+                        localHttpOk = true
+                    } else {
+                        espOldFirmwareDetected = true
+                    }
                 } else if (code == 403) {
-                    localHttpError = "Неверный PIN-пароль управления!"
+                    localHttpError = "❌ Неверный PIN-пароль управления!"
+                } else if (code == 302 || code == 404) {
+                    // В прошивке v1.0 неизвестный путь /control возвращает 302 Redirect на /
+                    espOldFirmwareDetected = true
                 }
                 conn.disconnect()
             } catch (_: Exception) {
@@ -132,15 +166,26 @@ class JkBmsBleService : Service() {
                 return@withContext Pair(false, localHttpError)
             }
 
-            // 2. Отправка через Облако (MQTT), чтобы работало из любой точки мира
-            val cloudOk = publishMqttCommand("jkbms/$topicId/cmd", "$pin:$cmd:$value")
-
             if (localHttpOk) {
-                Pair(true, "✅ Команда отправлена по локальному Wi-Fi ($host)")
-            } else if (cloudOk) {
-                Pair(true, "🌍 Команда отправлена через Интернет (Облако)")
+                // Оптимистично обновим UI сразу
+                svc?.applyOptimisticControl(cmd, value)
+                return@withContext Pair(true, "✅ Выполнено по домашнему Wi-Fi ($host)")
+            }
+
+            if (espOldFirmwareDetected) {
+                return@withContext Pair(
+                    false,
+                    "⚠️ На вашей ESP32 ($host) еще залита старая прошивка v1.0 (без управления и облака)! Прошейте обновленный скетч ESP32_JK_BMS_Gateway.ino через Arduino IDE."
+                )
+            }
+
+            // 2. Отправка через Облако (MQTT по TLS 8883 + TCP 1883 для мобильного интернета 4G/5G)
+            val cloudOk = publishMqttCommand("jkbms/$topicId/cmd", "$pin:$cmd:$value")
+            if (cloudOk) {
+                svc?.applyOptimisticControl(cmd, value)
+                Pair(true, "🌍 Команда доставлена через Интернет (Облако)")
             } else {
-                Pair(false, "❌ Нет связи со шлюзом (проверьте интернет или Wi-Fi)")
+                Pair(false, "❌ Нет связи со шлюзом (проверьте мобильный интернет или Wi-Fi)")
             }
         }
 
@@ -154,19 +199,62 @@ class JkBmsBleService : Service() {
             } while (rem > 0)
         }
 
+        private fun readFullyStatic(inp: InputStream, buf: ByteArray, len: Int): Boolean {
+            var total = 0
+            while (total < len) {
+                val r = inp.read(buf, total, len - total)
+                if (r <= 0) return false
+                total += r
+            }
+            return true
+        }
+
+        /**
+         * Открывает соединение с брокером MQTT:
+         * Пробует сначала TLS (порт 8883 — никогда не блокируется мобильными операторами 4G/5G),
+         * а затем обычный TCP (порт 1883).
+         */
+        private fun openBrokerSocket(timeoutMs: Int): Socket? {
+            // 1. Попытка через TLS 8883 (проходит через любых мобильных операторов)
+            try {
+                val rawSock = Socket()
+                rawSock.connect(InetSocketAddress(MQTT_BROKER_HOST, MQTT_BROKER_PORT_TLS), timeoutMs)
+                rawSock.soTimeout = timeoutMs
+                val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                val sslSock = sslFactory.createSocket(rawSock, MQTT_BROKER_HOST, MQTT_BROKER_PORT_TLS, true)
+                sslSock.soTimeout = timeoutMs
+                return sslSock
+            } catch (_: Exception) {
+            }
+
+            // 2. Фолбэк на обычный TCP 1883
+            return try {
+                val sock = Socket()
+                sock.connect(InetSocketAddress(MQTT_BROKER_HOST, MQTT_BROKER_PORT_TCP), timeoutMs)
+                sock.soTimeout = timeoutMs
+                sock
+            } catch (_: Exception) {
+                null
+            }
+        }
+
         private fun publishMqttCommand(topic: String, message: String): Boolean {
             var sock: Socket? = null
             return try {
-                sock = Socket()
-                sock.connect(InetSocketAddress(MQTT_BROKER_HOST, MQTT_BROKER_PORT), 2500)
-                sock.soTimeout = 2500
+                sock = openBrokerSocket(4500) ?: return false
                 val out = sock.getOutputStream()
                 val inp = sock.getInputStream()
 
-                val clientId = "jk-android-cmd-" + (System.currentTimeMillis() % 100000)
+                val clientId = "jk-cmd-" + (System.currentTimeMillis() % 1000000)
                 val idBytes = clientId.toByteArray(Charsets.UTF_8)
                 val connectBody = ByteArrayOutputStream()
-                connectBody.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 15))
+                connectBody.write(
+                    byteArrayOf(
+                        0x00, 0x04,
+                        'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(),
+                        0x04, 0x02, 0x00, 20
+                    )
+                )
                 connectBody.write((idBytes.size shr 8) and 0xFF)
                 connectBody.write(idBytes.size and 0xFF)
                 connectBody.write(idBytes)
@@ -179,25 +267,36 @@ class JkBmsBleService : Service() {
                 out.flush()
 
                 val connack = ByteArray(4)
-                if (inp.read(connack) < 4 || connack[0] != 0x20.toByte() || connack[3] != 0x00.toByte()) {
+                if (!readFullyStatic(inp, connack, 4) || connack[0] != 0x20.toByte() || connack[3] != 0x00.toByte()) {
                     return false
                 }
 
+                // Публикуем с QoS 1 (0x32), чтобы дождаться PUBACK от брокера перед закрытием сокета!
                 val topBytes = topic.toByteArray(Charsets.UTF_8)
                 val msgBytes = message.toByteArray(Charsets.UTF_8)
                 val pubBody = ByteArrayOutputStream()
                 pubBody.write((topBytes.size shr 8) and 0xFF)
                 pubBody.write(topBytes.size and 0xFF)
                 pubBody.write(topBytes)
+                pubBody.write(0x00) // Packet ID MSB
+                pubBody.write(0x07) // Packet ID LSB = 7
                 pubBody.write(msgBytes)
 
                 val pubPkt = ByteArrayOutputStream()
-                pubPkt.write(0x30) // PUBLISH QoS 0
+                pubPkt.write(0x32) // PUBLISH QoS 1
                 encodeMqttLength(pubPkt, pubBody.size())
                 pubPkt.write(pubBody.toByteArray())
                 out.write(pubPkt.toByteArray())
                 out.flush()
-                true
+
+                // Читаем 4 байта PUBACK (0x40 0x02 0x00 0x07)
+                val puback = ByteArray(4)
+                val ackOk = readFullyStatic(inp, puback, 4) && (puback[0].toInt() and 0xF0) == 0x40
+
+                // Корректный DISCONNECT
+                out.write(byteArrayOf(0xE0.toByte(), 0x00))
+                out.flush()
+                ackOk
             } catch (_: Exception) {
                 false
             } finally {
@@ -229,15 +328,33 @@ class JkBmsBleService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         createNotificationChannels()
-        promoteToForegroundSafely()
+        syncShadeVisibility(_stateFlow.value)
         startHybridGatewayLoops()
         startBlePollingLoop()
     }
 
-    private fun promoteToForegroundSafely() {
+    private fun syncShadeVisibility(state: JkBmsState) {
+        val prefs = AppPrefs(this)
+        if (prefs.shadeNotificationEnabled) {
+            promoteToForegroundSafely(state)
+        } else {
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Throwable) {
+            }
+            try {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(NOTIF_ID_MONITOR)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun promoteToForegroundSafely(state: JkBmsState) {
         try {
-            val notif = buildShadeNotification(_stateFlow.value)
+            val notif = buildShadeNotification(state)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NOTIF_ID_MONITOR,
@@ -249,7 +366,7 @@ class JkBmsBleService : Service() {
             }
         } catch (_: Throwable) {
             try {
-                startForeground(NOTIF_ID_MONITOR, buildShadeNotification(_stateFlow.value))
+                startForeground(NOTIF_ID_MONITOR, buildShadeNotification(state))
             } catch (_: Throwable) {
             }
         }
@@ -257,16 +374,21 @@ class JkBmsBleService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_UPDATE_SHADE -> {
+                syncShadeVisibility(_stateFlow.value)
+            }
             ACTION_PAUSE_FOR_JK_APP -> {
                 pauseConnectionForOfficialApp()
             }
             ACTION_RESUME, ACTION_START -> {
+                syncShadeVisibility(_stateFlow.value)
                 val prefs = AppPrefs(this)
                 if (prefs.useDirectBle && prefs.targetMacAddress.isNotBlank()) {
                     resumeAndConnect(forceReconnect = false)
                 }
             }
             ACTION_RECONNECT -> {
+                syncShadeVisibility(_stateFlow.value)
                 val prefs = AppPrefs(this)
                 if (prefs.useDirectBle && prefs.targetMacAddress.isNotBlank()) {
                     resumeAndConnect(forceReconnect = true)
@@ -274,7 +396,7 @@ class JkBmsBleService : Service() {
             }
             ACTION_STOP -> {
                 disconnectGatt()
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -282,10 +404,39 @@ class JkBmsBleService : Service() {
         return START_STICKY
     }
 
+    fun applyOptimisticControl(cmd: String, value: Int) {
+        val cur = _stateFlow.value
+        val enabled = value != 0
+        val updated = when (cmd) {
+            "chg" -> cur.copy(chargeMosEnabled = enabled)
+            "dsg" -> cur.copy(dischargeMosEnabled = enabled)
+            "bal" -> cur.copy(balanceEnabled = enabled)
+            else -> cur
+        }
+        updateState(updated)
+    }
+
+    fun sendBleControlRegister(reg: Byte, value: Int) {
+        serviceScope.launch {
+            sendCommand(JkBmsParser.buildControlCommand(reg, value))
+            delay(350)
+            sendCommand(JkBmsParser.buildCellInfoCommand())
+            val cmdName = when (reg) {
+                0x1D.toByte() -> "chg"
+                0x1E.toByte() -> "dsg"
+                0x1F.toByte() -> "bal"
+                else -> ""
+            }
+            if (cmdName.isNotEmpty()) {
+                applyOptimisticControl(cmdName, value)
+            }
+        }
+    }
+
     /**
      * Гибридный движок мониторинга:
      * 1. Быстрый локальный опрос ESP32 по домашнему Wi-Fi (http://192.168.123.105/status)
-     * 2. Постоянная облачная подписка MQTT (broker.emqx.io:1883) для работы из любой точки мира (4G/5G/чужой Wi-Fi)
+     * 2. Постоянная облачная подписка MQTT (TLS 8883 + TCP 1883) для работы из любой точки мира (4G/5G/чужой Wi-Fi)
      */
     private fun startHybridGatewayLoops() {
         localPollJob?.cancel()
@@ -333,16 +484,25 @@ class JkBmsBleService : Service() {
                 var sock: Socket? = null
 
                 try {
-                    sock = Socket()
-                    sock.connect(InetSocketAddress(MQTT_BROKER_HOST, MQTT_BROKER_PORT), 4000)
+                    sock = openBrokerSocket(5000)
+                    if (sock == null) {
+                        delay(4000)
+                        continue
+                    }
                     sock.soTimeout = 25000
                     val out = sock.getOutputStream()
                     val inp = sock.getInputStream()
 
-                    val clientId = "jk-android-sub-" + (System.currentTimeMillis() % 1000000)
+                    val clientId = "jk-sub-" + (System.currentTimeMillis() % 1000000)
                     val idBytes = clientId.toByteArray(Charsets.UTF_8)
                     val connectBody = ByteArrayOutputStream()
-                    connectBody.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 30))
+                    connectBody.write(
+                        byteArrayOf(
+                            0x00, 0x04,
+                            'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(),
+                            0x04, 0x02, 0x00, 30
+                        )
+                    )
                     connectBody.write((idBytes.size shr 8) and 0xFF)
                     connectBody.write(idBytes.size and 0xFF)
                     connectBody.write(idBytes)
@@ -431,15 +591,8 @@ class JkBmsBleService : Service() {
         return value
     }
 
-    private fun readFully(inp: InputStream, buf: ByteArray, len: Int): Boolean {
-        var total = 0
-        while (total < len) {
-            val r = inp.read(buf, total, len - total)
-            if (r <= 0) return false
-            total += r
-        }
-        return true
-    }
+    private fun readFully(inp: InputStream, buf: ByteArray, len: Int): Boolean =
+        readFullyStatic(inp, buf, len)
 
     private fun pauseConnectionForOfficialApp() {
         disconnectGatt()
@@ -658,6 +811,9 @@ class JkBmsBleService : Service() {
     private fun updateState(newState: JkBmsState) {
         val prev = _stateFlow.value
         _stateFlow.value = newState
+        val prefs = AppPrefs(this)
+        if (!prefs.shadeNotificationEnabled) return
+
         val now = System.currentTimeMillis()
         val statusChanged = prev.connected != newState.connected ||
             prev.paused != newState.paused ||
@@ -791,6 +947,7 @@ class JkBmsBleService : Service() {
     }
 
     override fun onDestroy() {
+        if (activeInstance === this) activeInstance = null
         localPollJob?.cancel()
         cloudMqttJob?.cancel()
         blePollJob?.cancel()
