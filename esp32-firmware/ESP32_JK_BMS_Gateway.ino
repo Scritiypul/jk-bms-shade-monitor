@@ -49,6 +49,8 @@ static NimBLEUUID charNotifyUUID("ffe1");
 static NimBLEUUID charWriteUUID("ffe2");
 
 volatile bool bmsConnected = false;
+volatile bool blePaused    = false;
+volatile unsigned long blePausedAtMs = 0;
 volatile unsigned long lastParsedMs  = 0;
 volatile unsigned long lastHttpReqMs = 0;
 
@@ -316,6 +318,18 @@ bool queueBMSControl(const String& cmdName, int val) {
     pendingCmdVal = 0;
     hasPendingCmd = true;
     return true;
+  } else if (cmdName == "ble") {
+    // val = 0 -> принудительно разорвать BLE-связь ESP32 с BMS (для входа через официальное приложение JK)
+    // val = 1 -> вернуть BLE-связь ESP32 с BMS
+    if (val == 0) {
+      blePaused = true;
+      blePausedAtMs = millis();
+      Serial.println("[BLE CMD] Принудительное отключение BLE от BMS (освобождение для офиц. приложения)...");
+    } else {
+      blePaused = false;
+      Serial.println("[BLE CMD] Возобновление BLE-соединения ESP32 с BMS...");
+    }
+    return true;
   }
   return false;
 }
@@ -406,10 +420,12 @@ String buildStatusJson() {
   String json;
   json.reserve(950);
   json += "{";
-  json += "\"connected\":" + String(bmsConnected ? "true" : "false") + ",";
-  json += "\"hasData\":" + String(snap.packets > 0 ? "true" : "false") + ",";
+  json += "\"connected\":" + String((bmsConnected && !blePaused) ? "true" : "false") + ",";
+  json += "\"blePaused\":" + String(blePaused ? "true" : "false") + ",";
+  json += "\"hasData\":" + String((snap.packets > 0 && !blePaused) ? "true" : "false") + ",";
   json += "\"fresh\":" + String(isFresh ? "true" : "false") + ",";
-  json += "\"statusText\":\"" + String(bmsConnected ? "Подключено (ESP32)" : "Поиск BMS по BLE...") + "\",";
+  String stTxt = blePaused ? "⏸ BLE отключен (свободен для офиц. приложения)" : (bmsConnected ? "Подключено (ESP32)" : "Поиск BMS по BLE...");
+  json += "\"statusText\":\"" + stTxt + "\",";
   json += "\"deviceName\":\"JK-B2A8S20P\",";
   json += "\"deviceAddress\":\"" + String(BMS_MAC) + "\",";
   json += "\"bmsMac\":\"" + String(BMS_MAC) + "\",";
@@ -932,6 +948,21 @@ void bleTask(void* parameter) {
   vTaskDelay(pdMS_TO_TICKS(2000));
 
   for (;;) {
+    // Если пользователь нажал «Отключить ESP32 от BMS» (чтобы зайти с официального приложения JK BMS)
+    if (blePaused) {
+      if (pClient && pClient->isConnected()) {
+        pClient->disconnect();
+      }
+      bmsConnected = false;
+      // Страховочный авто-возврат через 15 минут, если забыли включить обратно
+      if (millis() - blePausedAtMs > 15UL * 60UL * 1000UL) {
+        blePaused = false;
+        Serial.println("[BLE] Автоматическое возобновление связи с BMS после 15 мин паузы.");
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
     if (pClient && !pClient->isConnected()) {
       bmsConnected = false;
     }

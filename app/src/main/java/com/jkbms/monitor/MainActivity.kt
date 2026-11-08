@@ -12,6 +12,7 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ClipDrawable
@@ -27,6 +28,7 @@ import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -144,20 +146,28 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
 
+        val ivLogo = ImageView(this).apply {
+            setImageResource(R.drawable.ic_app_logo)
+            val lp = LinearLayout.LayoutParams(dp(38), dp(38))
+            lp.marginEnd = dp(10)
+            layoutParams = lp
+        }
+        headerRow.addView(ivLogo)
+
         val titleCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         titleCol.addView(TextView(this).apply {
-            text = "LiFePO4 24V • 230Ah"
+            text = "JK BMS Monitor"
             setTextColor(Color.parseColor("#F8FAFC"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 19.5f)
             typeface = Typeface.DEFAULT_BOLD
         })
         tvSubtitleInfo = TextView(this).apply {
-            text = "Шлюз: ${prefs.esp32Host} + Облако"
+            text = "24V 230Ah • Шлюз: ${prefs.esp32Host}"
             setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setPadding(0, dp(2), 0, 0)
         }
         titleCol.addView(tvSubtitleInfo)
@@ -454,25 +464,12 @@ class MainActivity : AppCompatActivity() {
         tempSection.addView(tempRow)
         root.addView(tempSection)
 
-        // Кнопка быстрого вызова настроек и управления внизу
-        val btnControlBig = Button(this).apply {
-            text = "⚙️ Управление BMS (Заряд / Разряд / Настройки)"
-            setBackgroundColor(Color.parseColor("#1D4ED8"))
-            setTextColor(Color.WHITE)
-            typeface = Typeface.DEFAULT_BOLD
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.topMargin = dp(14)
-            layoutParams = lp
-            setOnClickListener { showSettingsAndControlDialog() }
-        }
-        root.addView(btnControlBig)
-
         tvFooterMeta = TextView(this).apply {
             text = "Локальный Wi-Fi + Облачный доступ из любой точки мира"
             setTextColor(Color.parseColor("#64748B"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, 0)
+            setPadding(0, dp(12), 0, 0)
         }
         root.addView(tvFooterMeta)
 
@@ -694,62 +691,185 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(etPin)
 
-        // Строки управления Зарядом, Разрядом, Балансиром
-        fun addControlRow(label: String, cmdCode: String) {
-            val row = LinearLayout(this).apply {
+        // Строки управления Зарядом, Разрядом, Балансиром с наглядными тумблерами (Switch)
+        val curState = JkBmsBleService.stateFlow.value
+        var suppressSwitchCallback = false
+
+        fun styleSwitchVisuals(sw: Switch, badge: TextView, rowCard: LinearLayout, isOn: Boolean) {
+            badge.text = if (isOn) "ВКЛ" else "ВЫКЛ"
+            badge.setTextColor(Color.parseColor(if (isOn) "#10B981" else "#94A3B8"))
+            badge.background = cardBg(
+                if (isOn) "#0D2824" else "#162033",
+                if (isOn) "#10B981" else "#334155",
+                8
+            )
+            rowCard.background = cardBg(
+                if (isOn) "#112233" else "#111A2E",
+                if (isOn) "#1E3A5F" else "#1E293B",
+                14
+            )
+            sw.thumbTintList = ColorStateList.valueOf(
+                Color.parseColor(if (isOn) "#10B981" else "#94A3B8")
+            )
+            sw.trackTintList = ColorStateList.valueOf(
+                Color.parseColor(if (isOn) "#065F46" else "#334155")
+            )
+        }
+
+        fun addToggleControlRow(
+            label: String,
+            cmdCode: String,
+            initialChecked: Boolean
+        ): Triple<Switch, TextView, LinearLayout> {
+            val rowCard = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(6), 0, dp(6))
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                lp.topMargin = dp(8)
+                layoutParams = lp
             }
-            row.addView(TextView(this@MainActivity).apply {
+
+            val tvLabel = TextView(this@MainActivity).apply {
                 text = label
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                typeface = Typeface.DEFAULT_BOLD
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            val btnOn = Button(this@MainActivity).apply {
-                text = "ВКЛ"
-                setBackgroundColor(Color.parseColor("#10B981"))
-                setTextColor(Color.parseColor("#051B14"))
+            }
+
+            val tvBadge = TextView(this@MainActivity).apply {
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                 typeface = Typeface.DEFAULT_BOLD
-                setOnClickListener {
-                    val pin = etPin.text.toString().trim().ifBlank { "1234" }
-                    prefs.controlPin = pin
-                    tvCmdStatus.text = "⏳ Отправка команды $label -> ВКЛ..."
-                    mainScope.launch {
-                        val (ok, msg) = JkBmsBleService.sendGatewayControlCommand(this@MainActivity, cmdCode, 1, pin)
-                        tvCmdStatus.text = msg
-                        tvCmdStatus.setTextColor(if (ok) Color.parseColor("#4ADE80") else Color.parseColor("#EF4444"))
+                setPadding(dp(8), dp(3), dp(8), dp(3))
+                val blp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                blp.marginEnd = dp(8)
+                layoutParams = blp
+            }
+
+            val sw = Switch(this@MainActivity).apply {
+                isChecked = initialChecked
+            }
+
+            styleSwitchVisuals(sw, tvBadge, rowCard, initialChecked)
+
+            sw.setOnCheckedChangeListener { _, checked ->
+                if (suppressSwitchCallback) return@setOnCheckedChangeListener
+                styleSwitchVisuals(sw, tvBadge, rowCard, checked)
+                val pin = etPin.text.toString().trim().ifBlank { "1234" }
+                prefs.controlPin = pin
+                val targetVal = if (checked) 1 else 0
+                val stateWord = if (checked) "ВКЛ" else "ВЫКЛ"
+                tvCmdStatus.text = "⏳ Переключение: $label -> $stateWord..."
+                tvCmdStatus.setTextColor(Color.parseColor("#38BDF8"))
+                mainScope.launch {
+                    val (ok, msg) = JkBmsBleService.sendGatewayControlCommand(
+                        this@MainActivity,
+                        cmdCode,
+                        targetVal,
+                        pin
+                    )
+                    tvCmdStatus.text = msg
+                    tvCmdStatus.setTextColor(
+                        if (ok) Color.parseColor("#4ADE80") else Color.parseColor("#EF4444")
+                    )
+                    if (!ok) {
+                        suppressSwitchCallback = true
+                        sw.isChecked = !checked
+                        styleSwitchVisuals(sw, tvBadge, rowCard, !checked)
+                        suppressSwitchCallback = false
                     }
                 }
             }
-            val btnOff = Button(this@MainActivity).apply {
-                text = "ВЫКЛ"
-                setBackgroundColor(Color.parseColor("#EF4444"))
-                setTextColor(Color.WHITE)
-                typeface = Typeface.DEFAULT_BOLD
-                val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-                lp.marginStart = dp(6)
-                layoutParams = lp
-                setOnClickListener {
-                    val pin = etPin.text.toString().trim().ifBlank { "1234" }
-                    prefs.controlPin = pin
-                    tvCmdStatus.text = "⏳ Отправка команды $label -> ВЫКЛ..."
-                    mainScope.launch {
-                        val (ok, msg) = JkBmsBleService.sendGatewayControlCommand(this@MainActivity, cmdCode, 0, pin)
-                        tvCmdStatus.text = msg
-                        tvCmdStatus.setTextColor(if (ok) Color.parseColor("#4ADE80") else Color.parseColor("#EF4444"))
-                    }
-                }
-            }
-            row.addView(btnOn)
-            row.addView(btnOff)
-            container.addView(row)
+
+            rowCard.setOnClickListener { sw.toggle() }
+            rowCard.addView(tvLabel)
+            rowCard.addView(tvBadge)
+            rowCard.addView(sw)
+            container.addView(rowCard)
+            return Triple(sw, tvBadge, rowCard)
         }
 
-        addControlRow("⚡ Ключ Заряда (Charge):", "chg")
-        addControlRow("🔋 Ключ Разряда (Discharge):", "dsg")
-        addControlRow("⚖️ Балансировка (Balance):", "bal")
+        val (swChg, badgeChg, cardChg) = addToggleControlRow(
+            "⚡ Заряд (Charge)",
+            "chg",
+            curState.chargeMosEnabled
+        )
+        val (swDsg, badgeDsg, cardDsg) = addToggleControlRow(
+            "🔋 Разряд (Discharge)",
+            "dsg",
+            curState.dischargeMosEnabled
+        )
+        val (swBal, badgeBal, cardBal) = addToggleControlRow(
+            "⚖️ Балансировка",
+            "bal",
+            curState.balanceEnabled
+        )
+
+        // Кнопка принудительного разрыва BLE-связи платы с BMS для входа в официальное приложение JK BMS
+        val btnFreeBle = Button(this).apply {
+            typeface = Typeface.DEFAULT_BOLD
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.topMargin = dp(12)
+            layoutParams = lp
+        }
+
+        fun updateFreeBleButtonStyle(isBlePaused: Boolean) {
+            if (isBlePaused) {
+                btnFreeBle.text = "🔗 Подключить плату обратно к BMS"
+                btnFreeBle.setBackgroundColor(Color.parseColor("#10B981"))
+                btnFreeBle.setTextColor(Color.parseColor("#042016"))
+            } else {
+                btnFreeBle.text = "🔓 Отключить плату от BMS (для офиц. JK App)"
+                btnFreeBle.setBackgroundColor(Color.parseColor("#B45309"))
+                btnFreeBle.setTextColor(Color.WHITE)
+            }
+        }
+        updateFreeBleButtonStyle(curState.blePausedOnEsp)
+
+        btnFreeBle.setOnClickListener {
+            val pin = etPin.text.toString().trim().ifBlank { "1234" }
+            prefs.controlPin = pin
+            val currentlyPaused = JkBmsBleService.stateFlow.value.blePausedOnEsp
+            val newVal = if (currentlyPaused) 1 else 0
+            tvCmdStatus.text = if (newVal == 0) {
+                "⏳ Отключение BLE на плате ESP32 (освобождаем BMS)..."
+            } else {
+                "⏳ Возвращаем связь платы ESP32 с BMS..."
+            }
+            tvCmdStatus.setTextColor(Color.parseColor("#FACC15"))
+            mainScope.launch {
+                val (ok, msg) = JkBmsBleService.sendGatewayControlCommand(
+                    this@MainActivity,
+                    "ble",
+                    newVal,
+                    pin
+                )
+                tvCmdStatus.text = if (ok && newVal == 0) {
+                    "✅ Плата отключена от BMS! Теперь можно заходить в официальное приложение JK BMS."
+                } else if (ok && newVal == 1) {
+                    "✅ Плата снова подключается к BMS!"
+                } else {
+                    msg
+                }
+                tvCmdStatus.setTextColor(
+                    if (ok) Color.parseColor("#4ADE80") else Color.parseColor("#EF4444")
+                )
+                if (ok) {
+                    updateFreeBleButtonStyle(newVal == 0)
+                }
+            }
+        }
+        container.addView(btnFreeBle)
 
         // Настройки адреса шлюза ESP32 и Облачного ID
         container.addView(TextView(this).apply {
@@ -867,7 +987,27 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(swDirectBle)
 
-        AlertDialog.Builder(this)
+        val dialogSyncJob = mainScope.launch {
+            JkBmsBleService.stateFlow.collect { st ->
+                suppressSwitchCallback = true
+                if (swChg.isChecked != st.chargeMosEnabled) {
+                    swChg.isChecked = st.chargeMosEnabled
+                    styleSwitchVisuals(swChg, badgeChg, cardChg, st.chargeMosEnabled)
+                }
+                if (swDsg.isChecked != st.dischargeMosEnabled) {
+                    swDsg.isChecked = st.dischargeMosEnabled
+                    styleSwitchVisuals(swDsg, badgeDsg, cardDsg, st.dischargeMosEnabled)
+                }
+                if (swBal.isChecked != st.balanceEnabled) {
+                    swBal.isChecked = st.balanceEnabled
+                    styleSwitchVisuals(swBal, badgeBal, cardBal, st.balanceEnabled)
+                }
+                updateFreeBleButtonStyle(st.blePausedOnEsp)
+                suppressSwitchCallback = false
+            }
+        }
+
+        val dlg = AlertDialog.Builder(this)
             .setTitle("⚙️ Управление BMS и Настройки")
             .setView(scroll)
             .setPositiveButton("Сохранить") { _, _ ->
@@ -878,7 +1018,9 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Настройки сохранены", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Закрыть", null)
-            .show()
+            .create()
+        dlg.setOnDismissListener { dialogSyncJob.cancel() }
+        dlg.show()
     }
 
     private fun scanLocalSubnetForEsp32(onResult: (String?) -> Unit) {

@@ -411,6 +411,19 @@ class JkBmsBleService : Service() {
             "chg" -> cur.copy(chargeMosEnabled = enabled)
             "dsg" -> cur.copy(dischargeMosEnabled = enabled)
             "bal" -> cur.copy(balanceEnabled = enabled)
+            "ble" -> {
+                val isPaused = (value == 0)
+                cur.copy(
+                    connected = if (isPaused) false else cur.connected,
+                    paused = isPaused,
+                    blePausedOnEsp = isPaused,
+                    statusText = if (isPaused) {
+                        "⏸ BLE платы отключен (свободно для офиц. JK App)"
+                    } else {
+                        "🔄 Возобновление связи ESP32 с BMS..."
+                    }
+                )
+            }
             else -> cur
         }
         updateState(updated)
@@ -443,7 +456,7 @@ class JkBmsBleService : Service() {
         localPollJob = serviceScope.launch {
             while (isActive) {
                 val prefs = AppPrefs(this@JkBmsBleService)
-                if (!prefs.useDirectBle && !_stateFlow.value.paused) {
+                if (!prefs.useDirectBle) {
                     val host = prefs.esp32Host.ifBlank { "192.168.123.105" }
                     try {
                         val url = URL("http://$host/status")
@@ -474,7 +487,7 @@ class JkBmsBleService : Service() {
         cloudMqttJob = serviceScope.launch {
             while (isActive) {
                 val prefs = AppPrefs(this@JkBmsBleService)
-                if (prefs.useDirectBle || _stateFlow.value.paused) {
+                if (prefs.useDirectBle) {
                     delay(3000)
                     continue
                 }
@@ -533,7 +546,7 @@ class JkBmsBleService : Service() {
                         out.flush()
 
                         var lastPingMs = System.currentTimeMillis()
-                        while (isActive && !prefs.useDirectBle && !_stateFlow.value.paused) {
+                        while (isActive && !prefs.useDirectBle) {
                             val now = System.currentTimeMillis()
                             if (now - lastPingMs > 18000L) {
                                 out.write(byteArrayOf(0xC0.toByte(), 0x00)) // PINGREQ

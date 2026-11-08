@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="36dp"
+    android:height="36dp"
+    android:viewportWidth="36"
+    android:viewportHeight="36">
+    <!-- Фон иконки со скругленными углами -->
+    <path
+        android:fillColor="#111C33"
+        android:strokeColor="#263B5E"
+        android:strokeWidth="1.2"
+        android:pathData="M8,1h20c3.87,0 7,3.13 7,7v20c0,3.87 -3.13,7 -7,7H8c-3.87,0 -7,-3.13 -7,-7V8c0,-3.87 3.13,-7 7,-7z" />
+    <!-- Шапка батареи -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M14.5,6.5h7c0.83,0 1.5,0.67 1.5,1.5v1.5h-10V8c0,-0.83 0.67,-1.5 1.5,-1.5z" />
+    <!-- Контур батареи -->
+    <path
+        android:fillColor="#0B1326"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="1.6"
+        android:pathData="M11.5,9.5h13c1.38,0 2.5,1.12 2.5,2.5v15.5c0,1.38 -1.12,2.5 -2.5,2.5h-13c-1.38,0 -2.5,-1.12 -2.5,-2.5V12c0,-1.38 1.12,-2.5 2.5,-2.5z" />
+    <!-- Молния -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M19.5,12.2L13.8,19.8h3.8l-0.9,7l5.7,-7.6h-3.8L19.5,12.2z" />
+</vector>

@@ -9,6 +9,7 @@ import kotlin.math.roundToInt
 data class JkBmsState(
     val connected: Boolean = false,
     val paused: Boolean = false,
+    val blePausedOnEsp: Boolean = false,
     val statusText: String = "Ожидание подключения...",
     val connectionSource: String = "Поиск шлюза...",
     val deviceName: String = "JK-B2A8S20P",
@@ -95,7 +96,8 @@ object JkBmsParser {
     fun parseGatewayJson(jsonStr: String, sourceLabel: String): JkBmsState? {
         return try {
             val obj = JSONObject(jsonStr)
-            val isConn = obj.optBoolean("connected", false) || obj.optBoolean("hasData", false)
+            val espBlePaused = obj.optBoolean("blePaused", false)
+            val isConn = !espBlePaused && (obj.optBoolean("connected", false) || obj.optBoolean("hasData", false))
             val soc = obj.optInt("soc", obj.optInt("socPercent", 0)).coerceIn(0, 100)
             val totalV = obj.optDouble("totalVoltage", obj.optDouble("packVoltage", 0.0))
             val curA = obj.optDouble("current", obj.optDouble("currentAmps", 0.0))
@@ -157,10 +159,17 @@ object JkBmsParser {
                 obj.optInt("cellDeltaMv", 0)
             }
 
+            val statusLabel = when {
+                espBlePaused -> "⏸ BLE платы отключен (свободно для офиц. JK App)"
+                isConn -> "BMS Онлайн ($sourceLabel)"
+                else -> "ESP32 ищет BMS по BLE..."
+            }
+
             JkBmsState(
                 connected = isConn,
-                paused = false,
-                statusText = if (isConn) "BMS Онлайн ($sourceLabel)" else "ESP32 ищет BMS по BLE...",
+                paused = espBlePaused,
+                blePausedOnEsp = espBlePaused,
+                statusText = statusLabel,
                 connectionSource = sourceLabel,
                 deviceName = obj.optString("deviceName", "JK-B2A8S20P"),
                 deviceAddress = obj.optString("bmsMac", "C8:47:80:55:04:85"),
