@@ -13,6 +13,22 @@ class AppPrefs(context: Context) {
         get() = prefs.getString("target_name", "") ?: ""
         set(value) = prefs.edit().putString("target_name", value).apply()
 
+    var esp32Host: String
+        get() = prefs.getString("esp32_host", "192.168.123.105") ?: "192.168.123.105"
+        set(value) = prefs.edit().putString("esp32_host", value.trim()).apply()
+
+    var cloudTopicId: String
+        get() = prefs.getString("cloud_topic_id", "c84780550485") ?: "c84780550485"
+        set(value) = prefs.edit().putString("cloud_topic_id", value.trim()).apply()
+
+    var controlPin: String
+        get() = prefs.getString("control_pin", "1234") ?: "1234"
+        set(value) = prefs.edit().putString("control_pin", value.trim()).apply()
+
+    var useDirectBle: Boolean
+        get() = prefs.getBoolean("use_direct_ble", false)
+        set(value) = prefs.edit().putBoolean("use_direct_ble", value).apply()
+
     var alertsEnabled: Boolean
         get() = prefs.getBoolean("alerts_enabled", false)
         set(value) = prefs.edit().putBoolean("alerts_enabled", value).apply()

@@ -29,15 +29,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
+import java.io.InputStream
+import java.net.HttpURLConnection
 import java.net.Inet4Address
-import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
-import java.net.ServerSocket
+import java.net.Socket
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
 import java.util.UUID
 
@@ -56,6 +57,9 @@ class JkBmsBleService : Service() {
         private const val NOTIF_ID_MONITOR = 1001
         private const val NOTIF_ID_ALERT = 1002
 
+        const val MQTT_BROKER_HOST = "broker.emqx.io"
+        const val MQTT_BROKER_PORT = 1883
+
         val SERVICE_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
         val CHAR_NOTIFY_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
         val CHAR_WRITE_ALT_UUID: UUID = UUID.fromString("0000ffe2-0000-1000-8000-00805f9b34fb")
@@ -63,9 +67,6 @@ class JkBmsBleService : Service() {
 
         private val _stateFlow = MutableStateFlow(JkBmsState())
         val stateFlow: StateFlow<JkBmsState> = _stateFlow
-
-        const val WIFI_UDP_PORT = 48888
-        const val WIFI_HTTP_PORT = 48889
 
         fun getLocalWifiIp(): String {
             try {
@@ -88,21 +89,136 @@ class JkBmsBleService : Service() {
             }
             return ""
         }
+
+        /**
+         * Отправка команды управления в BMS:
+         * 1. Пробует локальный HTTP-запрос к ESP32 (/control), если телефон в домашней Wi-Fi сети
+         * 2. Одновременно отправляет команду через облачный брокер MQTT (работает из любой точки мира по 4G/5G/Wi-Fi!)
+         */
+        suspend fun sendGatewayControlCommand(
+            context: Context,
+            cmd: String,
+            value: Int,
+            pin: String
+        ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+            val prefs = AppPrefs(context)
+            val host = prefs.esp32Host.ifBlank { "192.168.123.105" }
+            val topicId = prefs.cloudTopicId.ifBlank { "c84780550485" }
+
+            var localHttpOk = false
+            var localHttpError = ""
+
+            // 1. Попытка через локальный HTTP (быстро, если дома)
+            try {
+                val encPin = URLEncoder.encode(pin, "UTF-8")
+                val url = URL("http://$host/control?pin=$encPin&cmd=$cmd&val=$value")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 1500
+                    readTimeout = 1500
+                    requestMethod = "GET"
+                }
+                val code = conn.responseCode
+                if (code == 200) {
+                    localHttpOk = true
+                } else if (code == 403) {
+                    localHttpError = "Неверный PIN-пароль управления!"
+                }
+                conn.disconnect()
+            } catch (_: Exception) {
+            }
+
+            if (localHttpError.isNotEmpty()) {
+                return@withContext Pair(false, localHttpError)
+            }
+
+            // 2. Отправка через Облако (MQTT), чтобы работало из любой точки мира
+            val cloudOk = publishMqttCommand("jkbms/$topicId/cmd", "$pin:$cmd:$value")
+
+            if (localHttpOk) {
+                Pair(true, "✅ Команда отправлена по локальному Wi-Fi ($host)")
+            } else if (cloudOk) {
+                Pair(true, "🌍 Команда отправлена через Интернет (Облако)")
+            } else {
+                Pair(false, "❌ Нет связи со шлюзом (проверьте интернет или Wi-Fi)")
+            }
+        }
+
+        private fun encodeMqttLength(out: ByteArrayOutputStream, length: Int) {
+            var rem = length
+            do {
+                var digit = rem % 128
+                rem /= 128
+                if (rem > 0) digit = digit or 0x80
+                out.write(digit)
+            } while (rem > 0)
+        }
+
+        private fun publishMqttCommand(topic: String, message: String): Boolean {
+            var sock: Socket? = null
+            return try {
+                sock = Socket()
+                sock.connect(InetSocketAddress(MQTT_BROKER_HOST, MQTT_BROKER_PORT), 2500)
+                sock.soTimeout = 2500
+                val out = sock.getOutputStream()
+                val inp = sock.getInputStream()
+
+                val clientId = "jk-android-cmd-" + (System.currentTimeMillis() % 100000)
+                val idBytes = clientId.toByteArray(Charsets.UTF_8)
+                val connectBody = ByteArrayOutputStream()
+                connectBody.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 15))
+                connectBody.write((idBytes.size shr 8) and 0xFF)
+                connectBody.write(idBytes.size and 0xFF)
+                connectBody.write(idBytes)
+
+                val connectPkt = ByteArrayOutputStream()
+                connectPkt.write(0x10)
+                encodeMqttLength(connectPkt, connectBody.size())
+                connectPkt.write(connectBody.toByteArray())
+                out.write(connectPkt.toByteArray())
+                out.flush()
+
+                val connack = ByteArray(4)
+                if (inp.read(connack) < 4 || connack[0] != 0x20.toByte() || connack[3] != 0x00.toByte()) {
+                    return false
+                }
+
+                val topBytes = topic.toByteArray(Charsets.UTF_8)
+                val msgBytes = message.toByteArray(Charsets.UTF_8)
+                val pubBody = ByteArrayOutputStream()
+                pubBody.write((topBytes.size shr 8) and 0xFF)
+                pubBody.write(topBytes.size and 0xFF)
+                pubBody.write(topBytes)
+                pubBody.write(msgBytes)
+
+                val pubPkt = ByteArrayOutputStream()
+                pubPkt.write(0x30) // PUBLISH QoS 0
+                encodeMqttLength(pubPkt, pubBody.size())
+                pubPkt.write(pubBody.toByteArray())
+                out.write(pubPkt.toByteArray())
+                out.flush()
+                true
+            } catch (_: Exception) {
+                false
+            } finally {
+                try { sock?.close() } catch (_: Exception) {}
+            }
+        }
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var pollJob: Job? = null
+    private var localPollJob: Job? = null
+    private var cloudMqttJob: Job? = null
+    private var blePollJob: Job? = null
+
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
-    private var httpServerSocket: ServerSocket? = null
-    private var udpDiscoverySocket: DatagramSocket? = null
-    @Volatile
-    private var lastKnownPcAddress: InetAddress? = null
 
     @Volatile
     private var isGattConnected = false
     @Volatile
     private var lastConnectAttemptMillis = 0L
+    @Volatile
+    private var lastLocalWifiSuccessMillis = 0L
     private var lastNotificationUpdateMillis = 0L
 
     private val rxBuffer = ByteArrayOutputStream()
@@ -114,8 +230,8 @@ class JkBmsBleService : Service() {
         super.onCreate()
         createNotificationChannels()
         startForeground(NOTIF_ID_MONITOR, buildShadeNotification(_stateFlow.value))
-        startPollingLoop()
-        startWifiBridge()
+        startHybridGatewayLoops()
+        startBlePollingLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -124,10 +240,16 @@ class JkBmsBleService : Service() {
                 pauseConnectionForOfficialApp()
             }
             ACTION_RESUME, ACTION_START -> {
-                resumeAndConnect(forceReconnect = false)
+                val prefs = AppPrefs(this)
+                if (prefs.useDirectBle && prefs.targetMacAddress.isNotBlank()) {
+                    resumeAndConnect(forceReconnect = false)
+                }
             }
             ACTION_RECONNECT -> {
-                resumeAndConnect(forceReconnect = true)
+                val prefs = AppPrefs(this)
+                if (prefs.useDirectBle && prefs.targetMacAddress.isNotBlank()) {
+                    resumeAndConnect(forceReconnect = true)
+                }
             }
             ACTION_STOP -> {
                 disconnectGatt()
@@ -139,13 +261,172 @@ class JkBmsBleService : Service() {
         return START_STICKY
     }
 
+    /**
+     * Гибридный движок мониторинга:
+     * 1. Быстрый локальный опрос ESP32 по домашнему Wi-Fi (http://192.168.123.105/status)
+     * 2. Постоянная облачная подписка MQTT (broker.emqx.io:1883) для работы из любой точки мира (4G/5G/чужой Wi-Fi)
+     */
+    private fun startHybridGatewayLoops() {
+        localPollJob?.cancel()
+        localPollJob = serviceScope.launch {
+            while (isActive) {
+                val prefs = AppPrefs(this@JkBmsBleService)
+                if (!prefs.useDirectBle && !_stateFlow.value.paused) {
+                    val host = prefs.esp32Host.ifBlank { "192.168.123.105" }
+                    try {
+                        val url = URL("http://$host/status")
+                        val conn = (url.openConnection() as HttpURLConnection).apply {
+                            connectTimeout = 1400
+                            readTimeout = 1400
+                            requestMethod = "GET"
+                            useCaches = false
+                        }
+                        if (conn.responseCode == 200) {
+                            val json = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                            val parsed = JkBmsParser.parseGatewayJson(json, "🏠 Дома Wi-Fi ($host)")
+                            if (parsed != null) {
+                                lastLocalWifiSuccessMillis = System.currentTimeMillis()
+                                updateState(parsed)
+                                checkOptionalAlerts(parsed)
+                            }
+                        }
+                        conn.disconnect()
+                    } catch (_: Exception) {
+                    }
+                }
+                delay(2000)
+            }
+        }
+
+        cloudMqttJob?.cancel()
+        cloudMqttJob = serviceScope.launch {
+            while (isActive) {
+                val prefs = AppPrefs(this@JkBmsBleService)
+                if (prefs.useDirectBle || _stateFlow.value.paused) {
+                    delay(3000)
+                    continue
+                }
+
+                val topicId = prefs.cloudTopicId.ifBlank { "c84780550485" }
+                val stateTopic = "jkbms/$topicId/status"
+                var sock: Socket? = null
+
+                try {
+                    sock = Socket()
+                    sock.connect(InetSocketAddress(MQTT_BROKER_HOST, MQTT_BROKER_PORT), 4000)
+                    sock.soTimeout = 25000
+                    val out = sock.getOutputStream()
+                    val inp = sock.getInputStream()
+
+                    val clientId = "jk-android-sub-" + (System.currentTimeMillis() % 1000000)
+                    val idBytes = clientId.toByteArray(Charsets.UTF_8)
+                    val connectBody = ByteArrayOutputStream()
+                    connectBody.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 30))
+                    connectBody.write((idBytes.size shr 8) and 0xFF)
+                    connectBody.write(idBytes.size and 0xFF)
+                    connectBody.write(idBytes)
+
+                    val connectPkt = ByteArrayOutputStream()
+                    connectPkt.write(0x10)
+                    encodeMqttLength(connectPkt, connectBody.size())
+                    connectPkt.write(connectBody.toByteArray())
+                    out.write(connectPkt.toByteArray())
+                    out.flush()
+
+                    val connack = ByteArray(4)
+                    if (readFully(inp, connack, 4) && connack[0] == 0x20.toByte() && connack[3] == 0x00.toByte()) {
+                        val topBytes = stateTopic.toByteArray(Charsets.UTF_8)
+                        val subBody = ByteArrayOutputStream()
+                        subBody.write(0x00)
+                        subBody.write(0x01)
+                        subBody.write((topBytes.size shr 8) and 0xFF)
+                        subBody.write(topBytes.size and 0xFF)
+                        subBody.write(topBytes)
+                        subBody.write(0x00)
+
+                        val subPkt = ByteArrayOutputStream()
+                        subPkt.write(0x82)
+                        encodeMqttLength(subPkt, subBody.size())
+                        subPkt.write(subBody.toByteArray())
+                        out.write(subPkt.toByteArray())
+                        out.flush()
+
+                        var lastPingMs = System.currentTimeMillis()
+                        while (isActive && !prefs.useDirectBle && !_stateFlow.value.paused) {
+                            val now = System.currentTimeMillis()
+                            if (now - lastPingMs > 18000L) {
+                                out.write(byteArrayOf(0xC0.toByte(), 0x00)) // PINGREQ
+                                out.flush()
+                                lastPingMs = now
+                            }
+
+                            val hdr = inp.read()
+                            if (hdr == -1) break
+                            val remLen = readMqttRemainingLength(inp)
+                            if (remLen < 0 || remLen > 16384) break
+
+                            val payload = ByteArray(remLen)
+                            if (!readFully(inp, payload, remLen)) break
+
+                            // Если пришел PUBLISH пакет (0x30..0x3F)
+                            if ((hdr and 0xF0) == 0x30 && remLen > 4) {
+                                val tLen = ((payload[0].toInt() and 0xFF) shl 8) or (payload[1].toInt() and 0xFF)
+                                var payStart = 2 + tLen
+                                if ((hdr and 0x06) != 0) payStart += 2
+                                if (payStart < remLen) {
+                                    val jsonStr = String(payload, payStart, remLen - payStart, Charsets.UTF_8)
+                                    // Если локальный Wi-Fi сейчас недоступен (> 3.5 сек), берем данные из Облака!
+                                    if (System.currentTimeMillis() - lastLocalWifiSuccessMillis > 3500L) {
+                                        val parsed = JkBmsParser.parseGatewayJson(jsonStr, "🌍 Интернет (Облако)")
+                                        if (parsed != null) {
+                                            updateState(parsed)
+                                            checkOptionalAlerts(parsed)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { sock?.close() } catch (_: Exception) {}
+                }
+                delay(4000)
+            }
+        }
+    }
+
+    private fun readMqttRemainingLength(inp: InputStream): Int {
+        var multiplier = 1
+        var value = 0
+        var encodedByte: Int
+        do {
+            encodedByte = inp.read()
+            if (encodedByte == -1) return -1
+            value += (encodedByte and 127) * multiplier
+            multiplier *= 128
+            if (multiplier > 128 * 128 * 128) return -1
+        } while ((encodedByte and 128) != 0)
+        return value
+    }
+
+    private fun readFully(inp: InputStream, buf: ByteArray, len: Int): Boolean {
+        var total = 0
+        while (total < len) {
+            val r = inp.read(buf, total, len - total)
+            if (r <= 0) return false
+            total += r
+        }
+        return true
+    }
+
     private fun pauseConnectionForOfficialApp() {
         disconnectGatt()
         updateState(
             _stateFlow.value.copy(
                 connected = false,
                 paused = true,
-                statusText = "На паузе (Bluetooth свободен для JK BMS)"
+                statusText = "На паузе"
             )
         )
     }
@@ -154,16 +435,7 @@ class JkBmsBleService : Service() {
         val prefs = AppPrefs(this)
         val mac = prefs.targetMacAddress
         val name = prefs.targetDeviceName
-        if (mac.isBlank()) {
-            updateState(
-                _stateFlow.value.copy(
-                    connected = false,
-                    paused = false,
-                    statusText = "Выберите вашу JK BMS в приложении"
-                )
-            )
-            return
-        }
+        if (mac.isBlank()) return
 
         val current = _stateFlow.value
         val alreadyConnectedToSame = isGattConnected &&
@@ -180,20 +452,20 @@ class JkBmsBleService : Service() {
                 paused = false,
                 deviceName = name,
                 deviceAddress = mac,
-                statusText = if (current.connected && !forceReconnect) "Подключено" else "Подключение к $name..."
+                statusText = "Подключение по BLE к $name..."
             )
         )
         connectToDevice(mac)
     }
 
-    private fun startPollingLoop() {
-        pollJob?.cancel()
-        pollJob = serviceScope.launch {
+    private fun startBlePollingLoop() {
+        blePollJob?.cancel()
+        blePollJob = serviceScope.launch {
             while (isActive) {
                 val st = _stateFlow.value
                 val prefs = AppPrefs(this@JkBmsBleService)
                 val now = System.currentTimeMillis()
-                if (!st.paused && prefs.targetMacAddress.isNotBlank()) {
+                if (prefs.useDirectBle && !st.paused && prefs.targetMacAddress.isNotBlank()) {
                     if (bluetoothGatt == null || (!isGattConnected && now - lastConnectAttemptMillis > 10_000L)) {
                         connectToDevice(prefs.targetMacAddress)
                     } else if (isGattConnected &&
@@ -201,9 +473,10 @@ class JkBmsBleService : Service() {
                         now - st.lastUpdatedMillis > 25_000L &&
                         now - lastConnectAttemptMillis > 25_000L
                     ) {
-                        // Переподключаемся только если поток уведомлений от BMS полностью завис (>25 сек)
                         connectToDevice(prefs.targetMacAddress)
                     }
+                } else if (!prefs.useDirectBle && bluetoothGatt != null) {
+                    disconnectGatt()
                 }
                 delay(5000)
             }
@@ -215,10 +488,7 @@ class JkBmsBleService : Service() {
         try {
             val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
             val adapter: BluetoothAdapter = btManager.adapter ?: return
-            if (!adapter.isEnabled) {
-                updateState(_stateFlow.value.copy(connected = false, statusText = "Включите Bluetooth"))
-                return
-            }
+            if (!adapter.isEnabled) return
 
             disconnectGatt()
             lastConnectAttemptMillis = System.currentTimeMillis()
@@ -228,8 +498,7 @@ class JkBmsBleService : Service() {
             } else {
                 device.connectGatt(this, false, gattCallback)
             }
-        } catch (e: Exception) {
-            updateState(_stateFlow.value.copy(connected = false, statusText = "Ошибка BLE: ${e.message}"))
+        } catch (_: Exception) {
         }
     }
 
@@ -252,28 +521,11 @@ class JkBmsBleService : Service() {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 isGattConnected = true
                 lastConnectAttemptMillis = System.currentTimeMillis()
-                updateState(_stateFlow.value.copy(statusText = "Обнаружение сервисов JK BMS..."))
                 gatt.requestMtu(512)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isGattConnected = false
-                try {
-                    gatt.close()
-                } catch (_: Exception) {
-                }
-                if (bluetoothGatt === gatt) {
-                    bluetoothGatt = null
-                }
-                val isPaused = _stateFlow.value.paused
-                updateState(
-                    _stateFlow.value.copy(
-                        connected = false,
-                        statusText = if (isPaused) {
-                            "На паузе (Bluetooth свободен для JK BMS)"
-                        } else {
-                            "Ожидание связи с JK BMS..."
-                        }
-                    )
-                )
+                try { gatt.close() } catch (_: Exception) {}
+                if (bluetoothGatt === gatt) bluetoothGatt = null
             }
         }
 
@@ -294,11 +546,10 @@ class JkBmsBleService : Service() {
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 gatt.writeDescriptor(descriptor)
             } else {
-                // Если дескриптора нет, сразу инициализируем поток
                 serviceScope.launch {
-                    delay(300)
+                    delay(250)
                     sendCommand(JkBmsParser.buildDeviceInfoCommand())
-                    delay(400)
+                    delay(350)
                     sendCommand(JkBmsParser.buildCellInfoCommand())
                 }
             }
@@ -340,7 +591,6 @@ class JkBmsBleService : Service() {
 
     @Synchronized
     private fun handleIncomingBytes(bytes: ByteArray) {
-        // Если пришел заголовок нового пакета 55 AA EB 90
         if (bytes.size >= 4 &&
             bytes[0] == 0x55.toByte() &&
             bytes[1] == 0xAA.toByte() &&
@@ -363,7 +613,6 @@ class JkBmsBleService : Service() {
         val raw = rxBuffer.toByteArray()
         if (raw.size < 250) return
 
-        // Находим старт заголовка 55 AA EB 90 внутри буфера
         var startIdx = -1
         for (i in 0..raw.size - 4) {
             if (raw[i] == 0x55.toByte() &&
@@ -404,7 +653,6 @@ class JkBmsBleService : Service() {
         if (!prefs.alertsEnabled || !state.connected) return
 
         val now = System.currentTimeMillis()
-        // Не чаще раза в 10 минут
         if (now - lastAlertTimeMillis < 10 * 60 * 1000L) return
 
         val maxTemp = maxOf(state.tempSensor1, state.tempSensor2, state.tempMos)
@@ -430,9 +678,6 @@ class JkBmsBleService : Service() {
         }
     }
 
-    /**
-     * Формирует информативное уведомление в шторке Android
-     */
     private fun buildShadeNotification(state: JkBmsState): Notification {
         val openAppIntent = PendingIntent.getActivity(
             this,
@@ -446,16 +691,12 @@ class JkBmsBleService : Service() {
         val expandedLines = StringBuilder()
 
         if (state.paused) {
-            title = "⏸ JK BMS: На паузе (канал свободен)"
-            shortLine = "Вы можете открыть родное приложение JK BMS"
-            expandedLines.append("Нажмите «Возобновить», когда закончите работу в официальном приложении JK BMS.")
-        } else if (!state.connected) {
+            title = "⏸ JK BMS: Мониторинг на паузе"
+            shortLine = "Нажмите, чтобы открыть дашборд"
+            expandedLines.append(shortLine)
+        } else if (!state.connected && state.lastUpdatedMillis == 0L) {
             title = "🔄 JK BMS: ${state.statusText}"
-            shortLine = if (state.socPercent > 0) {
-                "Посл. данные: 🔋 ${state.socPercent}% | Заряд: ${state.chargeWatts.toInt()} Вт·ч | Расход: ${state.dischargeWatts.toInt()} Вт·ч"
-            } else {
-                "Ожидание Bluetooth-соединения с B2A8S20P..."
-            }
+            shortLine = "Ожидание данных от ESP32 (Wi-Fi / Облако)..."
             expandedLines.append(shortLine)
         } else {
             val chargeW = state.chargeWatts.toInt()
@@ -467,46 +708,20 @@ class JkBmsBleService : Service() {
             val ampStr = String.format(Locale.US, "%+.1f", state.currentAmps)
 
             val modeIcon = when {
-                chargeW > 5 -> "⚡ Заряд +$chargeW Вт·ч"
-                dischargeW > 5 -> "🔻 Расход -$dischargeW Вт·ч"
-                else -> "💤 Покой (0 Вт·ч)"
+                chargeW > 5 -> "⚡ Заряд +$chargeW Вт"
+                dischargeW > 5 -> "🔻 Расход -$dischargeW Вт"
+                else -> "💤 Покой (0 Вт)"
             }
 
-            // Компактный заголовок (виден всегда в свернутой шторке и на экране блокировки)
             title = "🔋 ${state.socPercent}%  |  $modeIcon  |  🌡 ${t1}°C"
+            shortLine = "${state.connectionSource}  •  $voltStr В ($ampStr А)  •  ${state.getEstimatedTimeText()}"
 
-            // Вторая строка свернутого уведомления — четко по запросу: Зарядка, Расход и Температура
-            shortLine = "⚡ Зарядка: $chargeW Вт·ч/ч  •  🔻 Расход: $dischargeW Вт·ч/ч  •  🌡 $t1°C"
-
-            // Развернутый вид (когда тянешь уведомление в шторке вниз)
-            expandedLines.append("⚡ Скорость зарядки:  $chargeW Вт·ч (в час)\n")
-            expandedLines.append("🔻 Скорость расхода:  $dischargeW Вт·ч (в час)\n")
-            expandedLines.append("🌡 Температура:  Датчик 1: ${t1}°C  |  Датчик 2: ${t2}°C  |  MOS: ${tMos}°C\n")
-            expandedLines.append("🔋 Запас: ${String.format(Locale.US, "%.1f", state.remainingCapacityAh)} / ${String.format(Locale.US, "%.0f", state.nominalCapacityAh)} А·ч (~${state.remainingEnergyWh.toInt()} Вт·ч) • ${state.getEstimatedTimeText()}\n")
-            expandedLines.append("📊 Сеть: $voltStr В (${ampStr} А)  •  Разбег ячеек Δ: ${state.cellDeltaMv} мВ")
+            expandedLines.append("📡 Канал связи: ${state.connectionSource}\n")
+            expandedLines.append("⚡ Зарядка: $chargeW Вт   |   🔻 Расход: $dischargeW Вт\n")
+            expandedLines.append("🔋 Емкость: ${String.format(Locale.US, "%.1f", state.remainingCapacityAh)} / ${String.format(Locale.US, "%.0f", state.nominalCapacityAh)} А·ч (~${state.remainingEnergyWh.toInt()} Вт·ч) • ${state.getEstimatedTimeText()}\n")
+            expandedLines.append("🌡 Температура: T1: ${t1}°C  |  T2: ${t2}°C  |  MOS: ${tMos}°C\n")
+            expandedLines.append("📊 Сеть: $voltStr В ($ampStr А)  •  Разбег ячеек Δ: ${state.cellDeltaMv} мВ")
         }
-
-        val toggleIntent = Intent(this, JkBmsBleService::class.java).apply {
-            action = if (state.paused) ACTION_RESUME else ACTION_PAUSE_FOR_JK_APP
-        }
-        val togglePendingIntent = PendingIntent.getService(
-            this,
-            1,
-            toggleIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val refreshIntent = Intent(this, JkBmsBleService::class.java).apply {
-            action = ACTION_RECONNECT
-        }
-        val refreshPendingIntent = PendingIntent.getService(
-            this,
-            2,
-            refreshIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val toggleLabel = if (state.paused) "▶ Возобновить" else "⏸ Пауза (для JK App)"
 
         return NotificationCompat.Builder(this, CHANNEL_ID_MONITOR)
             .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
@@ -518,8 +733,6 @@ class JkBmsBleService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(openAppIntent)
-            .addAction(0, toggleLabel, togglePendingIntent)
-            .addAction(0, "🔄 Обновить", refreshPendingIntent)
             .build()
     }
 
@@ -532,7 +745,7 @@ class JkBmsBleService : Service() {
                 "Мониторинг JK BMS в шторке",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Постоянная сводка заряда, мощности (Вт·ч) и температуры JK BMS"
+                description = "Постоянная сводка заряда, мощности и температуры JK BMS"
                 setShowBadge(false)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
@@ -550,125 +763,10 @@ class JkBmsBleService : Service() {
         }
     }
 
-    private fun stateToJson(st: JkBmsState): String {
-        val obj = JSONObject()
-        obj.put("connected", st.connected)
-        obj.put("paused", st.paused)
-        obj.put("statusText", st.statusText)
-        obj.put("deviceName", st.deviceName)
-        obj.put("deviceAddress", st.deviceAddress)
-        obj.put("socPercent", st.socPercent)
-        obj.put("packVoltage", st.packVoltage)
-        obj.put("currentAmps", st.currentAmps)
-        obj.put("powerWatts", st.powerWatts)
-        obj.put("chargeWatts", st.chargeWatts)
-        obj.put("dischargeWatts", st.dischargeWatts)
-        obj.put("remainingCapacityAh", st.remainingCapacityAh)
-        obj.put("nominalCapacityAh", st.nominalCapacityAh)
-        obj.put("remainingEnergyWh", st.remainingEnergyWh)
-        obj.put("tempMos", st.tempMos)
-        obj.put("tempSensor1", st.tempSensor1)
-        obj.put("tempSensor2", st.tempSensor2)
-        obj.put("cellDeltaMv", st.cellDeltaMv)
-        obj.put("cycleCount", st.cycleCount)
-        obj.put("lastUpdatedMillis", st.lastUpdatedMillis)
-        obj.put("phoneIp", getLocalWifiIp())
-
-        val arr = JSONArray()
-        for (v in st.cellVoltages) {
-            arr.put(v)
-        }
-        obj.put("cellVoltages", arr)
-        return obj.toString()
-    }
-
-    private fun startWifiBridge() {
-        // 1. Периодическая UDP-рассылка состояния в локальную Wi-Fi сеть (порт 48888)
-        serviceScope.launch {
-            var sock: DatagramSocket? = null
-            try {
-                sock = DatagramSocket()
-                sock.broadcast = true
-                while (isActive) {
-                    try {
-                        val payload = stateToJson(_stateFlow.value).toByteArray(Charsets.UTF_8)
-                        val globalBcast = InetAddress.getByName("255.255.255.255")
-                        sock.send(DatagramPacket(payload, payload.size, globalBcast, WIFI_UDP_PORT))
-
-                        val localIp = getLocalWifiIp()
-                        if (localIp.isNotEmpty() && localIp.contains(".")) {
-                            val subnetBcast = localIp.substringBeforeLast(".") + ".255"
-                            sock.send(DatagramPacket(payload, payload.size, InetAddress.getByName(subnetBcast), WIFI_UDP_PORT))
-                        }
-
-                        val pcAddr = lastKnownPcAddress
-                        if (pcAddr != null) {
-                            sock.send(DatagramPacket(payload, payload.size, pcAddr, WIFI_UDP_PORT))
-                        }
-                    } catch (_: Exception) {
-                    }
-                    delay(1500)
-                }
-            } catch (_: Exception) {
-            } finally {
-                try { sock?.close() } catch (_: Exception) {}
-            }
-        }
-
-        // 2. UDP-слушатель запросов обнаружения от ПК на порту 48889
-        serviceScope.launch {
-            try {
-                val ds = DatagramSocket(WIFI_HTTP_PORT)
-                udpDiscoverySocket = ds
-                val buf = ByteArray(256)
-                while (isActive) {
-                    val pkt = DatagramPacket(buf, buf.size)
-                    ds.receive(pkt)
-                    lastKnownPcAddress = pkt.address
-                    val payload = stateToJson(_stateFlow.value).toByteArray(Charsets.UTF_8)
-                    ds.send(DatagramPacket(payload, payload.size, pkt.address, WIFI_UDP_PORT))
-                }
-            } catch (_: Exception) {
-            }
-        }
-
-        // 3. HTTP-сервер на порту 48889 (http://<IP-телефона>:48889/status)
-        serviceScope.launch {
-            try {
-                val server = ServerSocket(WIFI_HTTP_PORT)
-                httpServerSocket = server
-                while (isActive) {
-                    val client = server.accept()
-                    lastKnownPcAddress = client.inetAddress
-                    serviceScope.launch {
-                        try {
-                            client.soTimeout = 2000
-                            val json = stateToJson(_stateFlow.value)
-                            val bodyBytes = json.toByteArray(Charsets.UTF_8)
-                            val headers = "HTTP/1.1 200 OK\r\n" +
-                                "Content-Type: application/json; charset=utf-8\r\n" +
-                                "Content-Length: ${bodyBytes.size}\r\n" +
-                                "Access-Control-Allow-Origin: *\r\n" +
-                                "Connection: close\r\n\r\n"
-                            val out = client.getOutputStream()
-                            out.write(headers.toByteArray(Charsets.UTF_8))
-                            out.write(bodyBytes)
-                            out.flush()
-                        } catch (_: Exception) {
-                        } finally {
-                            try { client.close() } catch (_: Exception) {}
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            }
-        }
-    }
-
     override fun onDestroy() {
-        pollJob?.cancel()
-        try { httpServerSocket?.close() } catch (_: Exception) {}
-        try { udpDiscoverySocket?.close() } catch (_: Exception) {}
+        localPollJob?.cancel()
+        cloudMqttJob?.cancel()
+        blePollJob?.cancel()
         serviceScope.cancel()
         disconnectGatt()
         super.onDestroy()
