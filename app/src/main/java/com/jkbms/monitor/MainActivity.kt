@@ -655,7 +655,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Диалог управления ключами BMS (Заряд / Разряд / Балансировка) и настроек подключения
+     * Диалог управления ключами BMS (Заряд / Разряд / Балансировка) и повседневных настроек
      */
     private fun showSettingsAndControlDialog() {
         val scroll = ScrollView(this)
@@ -671,29 +671,14 @@ class MainActivity : AppCompatActivity() {
             text = "Команды работают и дома по Wi-Fi, и удаленно через Интернет!"
             setTextColor(Color.parseColor("#38BDF8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, 0, 0, dp(8))
         }
         container.addView(tvCmdStatus)
-
-        // Поле PIN-пароля управления
-        container.addView(TextView(this).apply {
-            text = "🔐 Пароль / PIN управления BMS:"
-            setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            typeface = Typeface.DEFAULT_BOLD
-        })
-        val etPin = EditText(this).apply {
-            setText(prefs.controlPin)
-            hint = "По умолчанию: 1234"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#64748B"))
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        container.addView(etPin)
 
         // Строки управления Зарядом, Разрядом, Балансиром с наглядными тумблерами (Switch)
         val curState = JkBmsBleService.stateFlow.value
         var suppressSwitchCallback = false
+        var lastUserToggleMs = 0L
 
         fun styleSwitchVisuals(sw: Switch, badge: TextView, rowCard: LinearLayout, isOn: Boolean) {
             badge.text = if (isOn) "ВКЛ" else "ВЫКЛ"
@@ -724,7 +709,7 @@ class MainActivity : AppCompatActivity() {
             val rowCard = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setPadding(dp(12), dp(11), dp(12), dp(11))
                 val lp = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
@@ -761,9 +746,9 @@ class MainActivity : AppCompatActivity() {
 
             sw.setOnCheckedChangeListener { _, checked ->
                 if (suppressSwitchCallback) return@setOnCheckedChangeListener
+                lastUserToggleMs = System.currentTimeMillis()
                 styleSwitchVisuals(sw, tvBadge, rowCard, checked)
-                val pin = etPin.text.toString().trim().ifBlank { "1234" }
-                prefs.controlPin = pin
+                val pin = prefs.controlPin.ifBlank { "1234" }
                 val targetVal = if (checked) 1 else 0
                 val stateWord = if (checked) "ВКЛ" else "ВЫКЛ"
                 tvCmdStatus.text = "⏳ Переключение: $label -> $stateWord..."
@@ -819,7 +804,7 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
-            lp.topMargin = dp(12)
+            lp.topMargin = dp(14)
             layoutParams = lp
         }
 
@@ -837,8 +822,8 @@ class MainActivity : AppCompatActivity() {
         updateFreeBleButtonStyle(curState.blePausedOnEsp)
 
         btnFreeBle.setOnClickListener {
-            val pin = etPin.text.toString().trim().ifBlank { "1234" }
-            prefs.controlPin = pin
+            lastUserToggleMs = System.currentTimeMillis()
+            val pin = prefs.controlPin.ifBlank { "1234" }
             val currentlyPaused = JkBmsBleService.stateFlow.value.blePausedOnEsp
             val newVal = if (currentlyPaused) 1 else 0
             tvCmdStatus.text = if (newVal == 0) {
@@ -871,66 +856,12 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(btnFreeBle)
 
-        // Настройки адреса шлюза ESP32 и Облачного ID
-        container.addView(TextView(this).apply {
-            text = "\n🌐 Подключение к ESP32 (Локально + Интернет):"
-            setTextColor(Color.parseColor("#38BDF8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(8), 0, dp(4))
-        })
-
-        container.addView(TextView(this).apply {
-            text = "Локальный IP адрес ESP32 в домашнем Wi-Fi:"
-            setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        })
-        val etHost = EditText(this).apply {
-            setText(prefs.esp32Host)
-            hint = "192.168.123.105"
-            setTextColor(Color.WHITE)
-        }
-        container.addView(etHost)
-
-        val btnScanWifi = Button(this).apply {
-            text = "🔍 Автопоиск ESP32 в домашней сети Wi-Fi"
-            setBackgroundColor(Color.parseColor("#1E293B"))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                tvCmdStatus.text = "🔍 Сканирование домашней Wi-Fi подсети..."
-                scanLocalSubnetForEsp32 { foundIp ->
-                    if (foundIp != null) {
-                        etHost.setText(foundIp)
-                        prefs.esp32Host = foundIp
-                        tvCmdStatus.text = "✅ Шлюз ESP32 найден: $foundIp"
-                        tvCmdStatus.setTextColor(Color.parseColor("#4ADE80"))
-                    } else {
-                        tvCmdStatus.text = "❌ ESP32 не найдена в локальной сети (будет использовано Облако)"
-                    }
-                }
-            }
-        }
-        container.addView(btnScanWifi)
-
-        container.addView(TextView(this).apply {
-            text = "Облачный ID вашей BMS (для доступа из любой точки мира):"
-            setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(8), 0, 0)
-        })
-        val etCloudId = EditText(this).apply {
-            setText(prefs.cloudTopicId)
-            hint = "c84780550485"
-            setTextColor(Color.WHITE)
-        }
-        container.addView(etCloudId)
-
         // Переключатель постоянной панели в шторке уведомлений Android
         val swShade = Switch(this).apply {
             text = "📲 Показывать сводку в шторке уведомлений"
             setTextColor(Color.WHITE)
             isChecked = prefs.shadeNotificationEnabled
-            setPadding(0, dp(12), 0, dp(6))
+            setPadding(0, dp(16), 0, dp(8))
             setOnCheckedChangeListener { _, checked ->
                 prefs.shadeNotificationEnabled = checked
                 startMonitorService(JkBmsBleService.ACTION_UPDATE_SHADE)
@@ -945,7 +876,7 @@ class MainActivity : AppCompatActivity() {
             text = "🔔 Звуковые уведомления (низкий заряд / перегрев)"
             setTextColor(Color.WHITE)
             isChecked = prefs.alertsEnabled
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(0, dp(6), 0, dp(8))
             setOnCheckedChangeListener { _, checked -> prefs.alertsEnabled = checked }
         }
         container.addView(swAlerts)
@@ -972,23 +903,29 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(seekSoc)
 
-        // Опциональный режим прямого Bluetooth (без ESP32)
-        val swDirectBle = Switch(this).apply {
-            text = "🦷 Прямой Bluetooth к BMS (вместо ESP32)"
+        // Кнопка перехода в скрытое меню «Настройки разработчика»
+        val btnDevSettings = Button(this).apply {
+            text = "🛠 Настройки разработчика"
+            setBackgroundColor(Color.parseColor("#1E293B"))
             setTextColor(Color.parseColor("#94A3B8"))
-            isChecked = prefs.useDirectBle
-            setPadding(0, dp(10), 0, dp(4))
-            setOnCheckedChangeListener { _, checked ->
-                prefs.useDirectBle = checked
-                if (checked && prefs.targetMacAddress.isBlank()) {
-                    if (hasBlePermissions()) showBleScannerDialog() else requestNeededPermissions()
-                }
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.topMargin = dp(18)
+            layoutParams = lp
+            setOnClickListener {
+                showDeveloperSettingsDialog()
             }
         }
-        container.addView(swDirectBle)
+        container.addView(btnDevSettings)
 
         val dialogSyncJob = mainScope.launch {
             JkBmsBleService.stateFlow.collect { st ->
+                // Не перещелкиваем тумблеры первые 4 секунды после нажатия пользователем
+                if (System.currentTimeMillis() - lastUserToggleMs < 4000L) {
+                    return@collect
+                }
                 suppressSwitchCallback = true
                 if (swChg.isChecked != st.chargeMosEnabled) {
                     swChg.isChecked = st.chargeMosEnabled
@@ -1008,19 +945,135 @@ class MainActivity : AppCompatActivity() {
         }
 
         val dlg = AlertDialog.Builder(this)
-            .setTitle("⚙️ Управление BMS и Настройки")
+            .setTitle("⚙️ Управление BMS")
+            .setView(scroll)
+            .setPositiveButton("Закрыть", null)
+            .create()
+        dlg.setOnDismissListener { dialogSyncJob.cancel() }
+        dlg.show()
+    }
+
+    /**
+     * Отдельное меню «Настройки разработчика» (спрятаны технические параметры сети, IP, Cloud ID, PIN и прямой BLE)
+     */
+    private fun showDeveloperSettingsDialog() {
+        val scroll = ScrollView(this)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = dp(18)
+            setPadding(p, dp(14), p, dp(14))
+            setBackgroundColor(Color.parseColor("#0F172A"))
+        }
+        scroll.addView(container)
+
+        val tvDevHint = TextView(this).apply {
+            text = "Технические параметры подключения к шлюзу ESP32 и облаку."
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, 0, 0, dp(10))
+        }
+        container.addView(tvDevHint)
+
+        container.addView(TextView(this).apply {
+            text = "🔐 Пароль / PIN управления BMS:"
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        val etPin = EditText(this).apply {
+            setText(prefs.controlPin)
+            hint = "По умолчанию: 1234"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.parseColor("#64748B"))
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        container.addView(etPin)
+
+        container.addView(TextView(this).apply {
+            text = "\n🌐 Локальный IP адрес ESP32 в домашнем Wi-Fi:"
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        val etHost = EditText(this).apply {
+            setText(prefs.esp32Host)
+            hint = "192.168.123.105"
+            setTextColor(Color.WHITE)
+        }
+        container.addView(etHost)
+
+        val btnScanWifi = Button(this).apply {
+            text = "🔍 Автопоиск ESP32 в домашней сети Wi-Fi"
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                tvDevHint.text = "🔍 Сканирование домашней Wi-Fi подсети..."
+                tvDevHint.setTextColor(Color.parseColor("#38BDF8"))
+                scanLocalSubnetForEsp32 { foundIp ->
+                    if (foundIp != null) {
+                        etHost.setText(foundIp)
+                        prefs.esp32Host = foundIp
+                        tvDevHint.text = "✅ Шлюз ESP32 найден: $foundIp"
+                        tvDevHint.setTextColor(Color.parseColor("#4ADE80"))
+                    } else {
+                        tvDevHint.text = "❌ ESP32 не найдена в локальной сети (используется Облако)"
+                        tvDevHint.setTextColor(Color.parseColor("#F59E0B"))
+                    }
+                }
+            }
+        }
+        container.addView(btnScanWifi)
+
+        container.addView(TextView(this).apply {
+            text = "\n☁️ Облачный ID вашей BMS (MQTT топик):"
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        val etCloudId = EditText(this).apply {
+            setText(prefs.cloudTopicId)
+            hint = "c84780550485"
+            setTextColor(Color.WHITE)
+        }
+        container.addView(etCloudId)
+
+        val swDirectBle = Switch(this).apply {
+            text = "🦷 Прямой Bluetooth к BMS (отключает работу через ESP32)"
+            setTextColor(Color.parseColor("#94A3B8"))
+            isChecked = prefs.useDirectBle
+            setPadding(0, dp(14), 0, dp(4))
+            setOnCheckedChangeListener { _, checked ->
+                prefs.useDirectBle = checked
+                if (checked) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "⚠️ Внимание: при прямом Bluetooth телефон занимает канал BMS и мешает плате ESP32!",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    if (prefs.targetMacAddress.isBlank()) {
+                        if (hasBlePermissions()) showBleScannerDialog() else requestNeededPermissions()
+                    } else {
+                        startMonitorService(JkBmsBleService.ACTION_RECONNECT)
+                    }
+                } else {
+                    startMonitorService(JkBmsBleService.ACTION_START)
+                }
+            }
+        }
+        container.addView(swDirectBle)
+
+        AlertDialog.Builder(this)
+            .setTitle("🛠 Настройки разработчика")
             .setView(scroll)
             .setPositiveButton("Сохранить") { _, _ ->
                 prefs.controlPin = etPin.text.toString().trim().ifBlank { "1234" }
                 prefs.esp32Host = etHost.text.toString().trim().ifBlank { "192.168.123.105" }
                 prefs.cloudTopicId = etCloudId.text.toString().trim().ifBlank { "c84780550485" }
                 renderState(JkBmsBleService.stateFlow.value)
-                Toast.makeText(this, "Настройки сохранены", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Технические настройки сохранены", Toast.LENGTH_SHORT).show()
             }
-            .setNegativeButton("Закрыть", null)
-            .create()
-        dlg.setOnDismissListener { dialogSyncJob.cancel() }
-        dlg.show()
+            .setNegativeButton("Отмена", null)
+            .show()
     }
 
     private fun scanLocalSubnetForEsp32(onResult: (String?) -> Unit) {

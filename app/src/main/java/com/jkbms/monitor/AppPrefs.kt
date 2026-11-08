@@ -25,9 +25,10 @@ class AppPrefs(context: Context) {
         get() = prefs.getString("control_pin", "1234") ?: "1234"
         set(value) = prefs.edit().putString("control_pin", value.trim()).apply()
 
+    // Новый ключ v22 гарантирует сброс случайно включенного прямого BLE, чтобы телефон не мешал плате ESP32
     var useDirectBle: Boolean
-        get() = prefs.getBoolean("use_direct_ble", false)
-        set(value) = prefs.edit().putBoolean("use_direct_ble", value).apply()
+        get() = prefs.getBoolean("use_direct_ble_v22", false)
+        set(value) = prefs.edit().putBoolean("use_direct_ble_v22", value).apply()
 
     var shadeNotificationEnabled: Boolean
         get() = prefs.getBoolean("shade_notif_enabled", true)

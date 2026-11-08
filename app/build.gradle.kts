@@ -11,8 +11,8 @@ android {
         applicationId = "com.jkbms.monitor"
         minSdk = 26
         targetSdk = 33
-        versionCode = 5
-        versionName = "2.1.0"
+        versionCode = 6
+        versionName = "2.2.0"
     }
 
     buildTypes {

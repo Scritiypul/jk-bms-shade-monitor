@@ -1,22 +1,28 @@
 /*
  * ============================================================================
- * ESP32 JK-BMS Wi-Fi + Cloud + BLE Шлюз v2.0 (Локальный сервер + Доступ из мира + Управление)
+ * ESP32 JK-BMS Wi-Fi + Cloud + BLE Шлюз v2.2 (Стабильный парсер + Управление)
  * ============================================================================
  * Плата:       ESP32 Dev Module (ESP32-WROOM-32, CP2102)
  * Разделы:     Huge APP (3MB No OTA / 1MB SPIFFS)
  * Библиотеки:  NimBLE-Arduino (by h2zero) — других внешних библиотек НЕ требуется!
  *
- * Что нового в версии 2.0:
- * 1. ДОСТУП ИЗ ЛЮБОЙ ТОЧКИ МИРА (4G/5G/любой Wi-Fi):
- *    Встроен легковесный облачный клиент MQTT поверх стандартного WiFiClient
- *    (брокер broker.emqx.io:1883, топик jkbms/c84780550485/status и /cmd).
- *    Смартфон с новым APK видит батарею и дома по локальному Wi-Fi, и вне дома
- *    через мобильный интернет!
- * 2. УПРАВЛЕНИЕ BMS (Заряд / Разряд / Балансировка):
- *    Поддержка команд включения/выключения силовых ключей заряда (0xAB),
- *    разряда (0xAC) и балансира (0xAD) с защитой паролем/PIN-кодом как через
- *    локальный HTTP (/control), так и удаленно через интернет!
- * 3. БЕЗ ПЕРИОДИЧЕСКОГО ПИСКА И С ПРИОРИТЕТОМ WI-FI.
+ * Что исправлено и улучшено в версии 2.2:
+ * 1. ИСПРАВЛЕНЫ "СУМАСШЕДШИЕ" ЗНАЧЕНИЯ (1413548.63 В / А):
+ *    - Жесткая проверка контрольной суммы CRC-8 каждого 300-байтного кадра JK BMS.
+ *    - Скользящий поиск заголовка 55 AA EB 90 без потери фрагментов BLE-пакетов.
+ *    - Приоритет смещения JK02_24S (shift = 0) для JK-B2A8S20P и фильтрация
+ *      мусорного заполнения 0x51 0x2E 0x41 0x54 (1413548.625).
+ *    - Сверка общего напряжения батареи с суммой 8 ячеек.
+ * 2. СИНХРОНИЗАЦИЯ ТУМБЛЕРОВ (Заряд / Разряд / Балансировка):
+ *    - Чтение как кадра ячеек (0x02), так и кадра настроек (0x01) для точного
+ *      отображения состояния ключей Charge, Discharge и Balancer.
+ *    - Задержка 3.5 сек после переключения тумблера, чтобы старые пакеты в полете
+ *      не возвращали тумблер назад.
+ * 3. СТАБИЛЬНОЕ BLE-СОЕДИНЕНИЕ БЕЗ ОШИБКИ 520 ("Сервис FFE0 не найден"):
+ *    - Убрано замедление параметров BLE во время поиска сервисов GATT.
+ * 4. МГНОВЕННОЕ ОТКЛЮЧЕНИЕ ПЛАТЫ ОТ BMS ПО КНОПКЕ:
+ *    - Кнопка "Отключить плату от BMS" мгновенно разрывает BLE-связь и держит
+ *      паузу, не пытаясь переподключиться, пока вы не нажмете "Подключить обратно".
  * ============================================================================
  */
 
@@ -32,7 +38,7 @@ const char* WIFI_SSID   = "Sweet Home";
 const char* WIFI_PASS   = "ПАРОЛЬ";              // <-- Ваш пароль от домашнего Wi-Fi
 const char* BMS_MAC     = "c8:47:80:55:04:85";   // MAC вашей JK-B2A8S20P
 const char* MDNS_NAME   = "jkbms";               // Доступ по http://jkbms.local
-const char* CONTROL_PIN = "1234";                // Пароль/PIN для управления ключами BMS из приложения и сайта
+const char* CONTROL_PIN = "1234";                // Пароль/PIN для управления ключами BMS
 
 // Облачный канал для доступа из любой точки мира (уникальный по MAC вашей BMS)
 const char* MQTT_HOST        = "broker.emqx.io";
@@ -50,14 +56,20 @@ static NimBLEUUID charWriteUUID("ffe2");
 
 volatile bool bmsConnected = false;
 volatile bool blePaused    = false;
-volatile unsigned long blePausedAtMs = 0;
-volatile unsigned long lastParsedMs  = 0;
-volatile unsigned long lastHttpReqMs = 0;
+volatile unsigned long blePausedAtMs      = 0;
+volatile unsigned long lastParsedMs       = 0;
+volatile unsigned long lastHttpReqMs      = 0;
+volatile unsigned long lastControlCmdMs   = 0;
+volatile bool needImmediateCloudPublish   = false;
 
 // Очередь команд управления BMS (выполняется в задаче BLETask)
 volatile uint8_t pendingCmdReg = 0;
 volatile uint32_t pendingCmdVal = 0;
 volatile bool hasPendingCmd = false;
+
+// Сохраненное состояние переключателей из кадра настроек 0x01
+volatile bool hasSettingsFrame = false;
+volatile bool settingsBalState = false;
 
 NimBLERemoteCharacteristic* pNotifyChar = nullptr;
 NimBLERemoteCharacteristic* pWriteChar  = nullptr;
@@ -80,46 +92,80 @@ struct BMSData {
   float balanceCurrent = 0;
   int soc = 0;
   float remainCap = 0;
-  float nominalCap = 230.0;
+  float nominalCap = 230.0f;
   int cycleCount = 0;
   float tempMos = 0;
   float temp1 = 0;
   float temp2 = 0;
-  bool chg = false;
-  bool dsg = false;
-  bool bal = false;
+  bool chg = true;
+  bool dsg = true;
+  bool bal = true;
   uint32_t packets = 0;
   unsigned long lastUpdateMs = 0;
 } bms;
 
-uint8_t frameBuf[360];
+uint8_t frameBuf[320];
 int framePos = 0;
+uint8_t prevB0 = 0, prevB1 = 0, prevB2 = 0;
+
+static uint32_t readU32LE(const uint8_t* d, int offset) {
+  return (uint32_t)d[offset] |
+         ((uint32_t)d[offset + 1] << 8) |
+         ((uint32_t)d[offset + 2] << 16) |
+         ((uint32_t)d[offset + 3] << 24);
+}
 
 static float readTemp16(const uint8_t* d, int offset) {
   int16_t raw = (int16_t)(d[offset] | (d[offset + 1] << 8));
   float t = raw * 0.1f;
-  return (t >= -50.0f && t <= 150.0f) ? t : 0.0f;
+  return (t >= -45.0f && t <= 130.0f) ? t : 0.0f;
 }
 
+// Определение смещения полей (для JK-B2A8S20P используется протокол JK02_24S: shift = 0)
 static int detectOffsetShift(const uint8_t* d, float cellsSum) {
-  uint32_t rawV0  = (uint32_t)d[118] | ((uint32_t)d[119] << 8) | ((uint32_t)d[120] << 16) | ((uint32_t)d[121] << 24);
-  uint32_t rawV32 = (uint32_t)d[150] | ((uint32_t)d[151] << 8) | ((uint32_t)d[152] << 16) | ((uint32_t)d[153] << 24);
+  uint32_t rawV0  = readU32LE(d, 118);
+  uint32_t rawV32 = readU32LE(d, 150);
+
+  // Защита от паттерна заполнения 0x51 0x2E 0x41 0x54 (0x54412E51 = 1413548625)
+  if (rawV32 == 0x54412E51UL) return 0;
+  if (rawV0  == 0x54412E51UL) return 32;
+
   float v0  = rawV0 * 0.001f;
   float v32 = rawV32 * 0.001f;
   uint8_t soc0  = d[141];
   uint8_t soc32 = d[173];
 
-  if (cellsSum > 5.0f) {
+  if (cellsSum > 8.0f) {
     float diff0  = fabs(v0 - cellsSum);
     float diff32 = fabs(v32 - cellsSum);
-    if (diff32 < 2.5f && soc32 <= 100) return 32;
     if (diff0  < 2.5f && soc0  <= 100) return 0;
+    if (diff32 < 2.5f && soc32 <= 100) return 32;
   }
-  if (v32 >= 8.0f && v32 <= 60.0f && soc32 <= 100) return 32;
-  if (v0  >= 8.0f && v0  <= 60.0f && soc0  <= 100) return 0;
-  return 32;
+  if (v0  >= 10.0f && v0  <= 45.0f && soc0  <= 100) return 0;
+  if (v32 >= 10.0f && v32 <= 45.0f && soc32 <= 100) return 32;
+  return 0;
 }
 
+// Разбор кадра настроек 0x01 (для 100% точного состояния тумблеров Заряд / Разряд / Балансир)
+void parseJKSettingsFrame(const uint8_t* d) {
+  uint32_t rawChg = readU32LE(d, 118);
+  uint32_t rawDsg = readU32LE(d, 122);
+  uint32_t rawBal = readU32LE(d, 126);
+
+  if (rawChg <= 1 && rawDsg <= 1 && rawBal <= 1) {
+    hasSettingsFrame = true;
+    settingsBalState = (rawBal != 0);
+    if (millis() - lastControlCmdMs > 3500UL) {
+      portENTER_CRITICAL(&bmsMux);
+      bms.chg = (rawChg != 0);
+      bms.dsg = (rawDsg != 0);
+      bms.bal = (rawBal != 0);
+      portEXIT_CRITICAL(&bmsMux);
+    }
+  }
+}
+
+// Разбор основного кадра телеметрии ячеек 0x02 (300 байт, проверенный по CRC-8)
 void parseJKFrame(const uint8_t* d) {
   float tempCells[8] = {0};
   float minC = 99.0f, maxC = 0.0f, sumC = 0.0f;
@@ -129,8 +175,8 @@ void parseJKFrame(const uint8_t* d) {
   for (int i = 0; i < 8; i++) {
     uint16_t mv = (uint16_t)d[6 + i * 2] | ((uint16_t)d[7 + i * 2] << 8);
     float cv = mv * 0.001f;
-    tempCells[i] = cv;
-    if (cv > 1.0f && cv < 5.0f) {
+    if (cv >= 1.5f && cv <= 4.5f) {
+      tempCells[i] = cv;
       if (cv < minC) { minC = cv; minIdx = i + 1; }
       if (cv > maxC) { maxC = cv; maxIdx = i + 1; }
       sumC += cv;
@@ -138,60 +184,95 @@ void parseJKFrame(const uint8_t* d) {
     }
   }
 
+  // Для 8S батареи должно быть минимум 4 валидные ячейки
+  if (validCells < 4 || sumC < 10.0f || sumC > 38.0f) {
+    return;
+  }
+
   int shift = detectOffsetShift(d, sumC);
 
-  uint32_t totMv = (uint32_t)d[118 + shift] | ((uint32_t)d[119 + shift] << 8) |
-                   ((uint32_t)d[120 + shift] << 16) | ((uint32_t)d[121 + shift] << 24);
-  int32_t curMa  = (int32_t)((uint32_t)d[126 + shift] | ((uint32_t)d[127 + shift] << 8) |
-                   ((uint32_t)d[128 + shift] << 16) | ((uint32_t)d[129 + shift] << 24));
+  uint32_t totMv = readU32LE(d, 118 + shift);
+  uint32_t rawCur = readU32LE(d, 126 + shift);
+  int32_t curMa = (int32_t)rawCur;
+
+  // Защита от мусорных байтов заполнения 0x51 0x2E 0x41 0x54 (1413548.625)
+  if (totMv == 0x54412E51UL || rawCur == 0x54412E51UL) {
+    return;
+  }
+
+  float totV = totMv * 0.001f;
+  // Если общее напряжение оторвано от суммы ячеек более чем на 3.5 В — берем сумму ячеек или отбрасываем искаженный кадр
+  if (totV < 10.0f || totV > 40.0f || fabs(totV - sumC) > 3.5f) {
+    return;
+  }
+
+  float curA = curMa * 0.001f;
+  if (fabs(curA) > 350.0f) {
+    return;
+  }
 
   float t1   = readTemp16(d, 130 + shift);
   float t2   = readTemp16(d, 132 + shift);
   float tMos = readTemp16(d, (shift == 0) ? 134 : (112 + shift));
 
   int16_t balMa = (int16_t)(d[138 + shift] | (d[139 + shift] << 8));
-  bool balActive = (d[140 + shift] != 0);
+  float balCurA = balMa * 0.001f;
+  if (fabs(balCurA) > 5.0f) balCurA = 0.0f;
+
+  uint8_t rawBalByte = d[140 + shift];
+  bool balActive = (rawBalByte == 1 || rawBalByte == 2);
+
   int socVal = d[141 + shift];
-  if (socVal > 100) socVal = 100;
+  if (socVal > 100) return;
 
-  uint32_t remMah = (uint32_t)d[142 + shift] | ((uint32_t)d[143 + shift] << 8) |
-                    ((uint32_t)d[144 + shift] << 16) | ((uint32_t)d[145 + shift] << 24);
-  uint32_t nomMah = (uint32_t)d[146 + shift] | ((uint32_t)d[147 + shift] << 8) |
-                    ((uint32_t)d[148 + shift] << 16) | ((uint32_t)d[149 + shift] << 24);
-  uint32_t cycles = (uint32_t)d[150 + shift] | ((uint32_t)d[151 + shift] << 8) |
-                    ((uint32_t)d[152 + shift] << 16) | ((uint32_t)d[153 + shift] << 24);
+  uint32_t remMah = readU32LE(d, 142 + shift);
+  uint32_t nomMah = readU32LE(d, 146 + shift);
+  uint32_t cycles = readU32LE(d, 150 + shift);
 
-  bool chgMos = (d[166 + shift] != 0);
-  bool dsgMos = (d[167 + shift] != 0);
+  float nomAh = (nomMah != 0x54412E51UL && nomMah >= 5000 && nomMah <= 1000000) ? (nomMah * 0.001f) : 230.0f;
+  float remAh = (remMah != 0x54412E51UL && remMah <= 1000000) ? (remMah * 0.001f) : (nomAh * socVal * 0.01f);
+  if (remAh > nomAh * 1.1f) remAh = nomAh * socVal * 0.01f;
+  if (cycles == 0x54412E51UL || cycles > 50000) cycles = 0;
+
+  // В JK02_24S байты 166 и 167 всегда равны 0 или 1 (состояние ключей Заряда и Разряда)
+  uint8_t rawChgByte = d[166 + shift];
+  uint8_t rawDsgByte = d[167 + shift];
 
   unsigned long now = millis();
+  bool allowSwitchOverwrite = (now - lastControlCmdMs > 3500UL);
+
   portENTER_CRITICAL(&bmsMux);
-  for (int i = 0; i < 8; i++) bms.cells[i] = tempCells[i];
-  if (validCells > 0) {
-    bms.cellMin = minC;
-    bms.cellMax = maxC;
-    bms.cellAvg = sumC / validCells;
-    bms.voltDiff = maxC - minC;
-    bms.minCellIdx = minIdx;
-    bms.maxCellIdx = maxIdx;
+  for (int i = 0; i < 8; i++) {
+    if (tempCells[i] > 0.5f) bms.cells[i] = tempCells[i];
   }
-  bms.totalVoltage = totMv * 0.001f;
-  if (bms.totalVoltage < 1.0f && sumC > 5.0f) {
-    bms.totalVoltage = sumC;
-  }
-  bms.current = curMa * 0.001f;
-  bms.power = bms.totalVoltage * bms.current;
+  bms.cellMin = minC;
+  bms.cellMax = maxC;
+  bms.cellAvg = sumC / validCells;
+  bms.voltDiff = maxC - minC;
+  bms.minCellIdx = minIdx;
+  bms.maxCellIdx = maxIdx;
+  bms.totalVoltage = totV;
+  bms.current = curA;
+  bms.power = totV * curA;
   bms.temp1 = t1;
   bms.temp2 = t2;
   bms.tempMos = tMos;
-  bms.balanceCurrent = balMa * 0.001f;
-  bms.bal = balActive;
+  bms.balanceCurrent = balCurA;
   bms.soc = socVal;
-  bms.remainCap = remMah * 0.001f;
-  if (nomMah > 1000) bms.nominalCap = nomMah * 0.001f;
+  bms.remainCap = remAh;
+  bms.nominalCap = nomAh;
   bms.cycleCount = (int)cycles;
-  bms.chg = chgMos;
-  bms.dsg = dsgMos;
+
+  if (allowSwitchOverwrite) {
+    if (rawChgByte <= 1) bms.chg = (rawChgByte != 0);
+    if (rawDsgByte <= 1) bms.dsg = (rawDsgByte != 0);
+    if (hasSettingsFrame) {
+      bms.bal = settingsBalState;
+    } else if (rawBalByte <= 2) {
+      bms.bal = balActive;
+    }
+  }
+
   bms.packets++;
   bms.lastUpdateMs = now;
   portEXIT_CRITICAL(&bmsMux);
@@ -200,48 +281,41 @@ void parseJKFrame(const uint8_t* d) {
 }
 
 void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
-  if (framePos == 0 && (millis() - lastParsedMs < 1500)) {
-    return;
-  }
-
-  if (length >= 4 && pData[0] == 0x55 && pData[1] == 0xAA && pData[2] == 0xEB && pData[3] == 0x90) {
-    framePos = 0;
-  }
-
   for (size_t i = 0; i < length; i++) {
     uint8_t b = pData[i];
 
-    if (framePos == 0) {
-      if (b == 0x55) frameBuf[framePos++] = b;
+    // Скользящее обнаружение заголовка 55 AA EB 90 в любом месте потока байтов
+    if (prevB0 == 0x55 && prevB1 == 0xAA && prevB2 == 0xEB && b == 0x90) {
+      frameBuf[0] = 0x55;
+      frameBuf[1] = 0xAA;
+      frameBuf[2] = 0xEB;
+      frameBuf[3] = 0x90;
+      framePos = 4;
+      prevB0 = prevB1; prevB1 = prevB2; prevB2 = b;
       continue;
     }
-    if (framePos == 1) {
-      if (b == 0xAA) frameBuf[framePos++] = b;
-      else if (b == 0x55) framePos = 1;
-      else framePos = 0;
-      continue;
-    }
-    if (framePos == 2) {
-      if (b == 0xEB) frameBuf[framePos++] = b;
-      else if (b == 0x55) { frameBuf[0] = 0x55; framePos = 1; }
-      else framePos = 0;
-      continue;
-    }
-    if (framePos == 3) {
-      if (b == 0x90) frameBuf[framePos++] = b;
-      else if (b == 0x55) { frameBuf[0] = 0x55; framePos = 1; }
-      else framePos = 0;
-      continue;
-    }
+    prevB0 = prevB1;
+    prevB1 = prevB2;
+    prevB2 = b;
 
-    frameBuf[framePos++] = b;
-
-    if (framePos >= 300) {
-      if (frameBuf[4] == 0x02) {
-        parseJKFrame(frameBuf);
+    if (framePos >= 4 && framePos < 300) {
+      frameBuf[framePos++] = b;
+      if (framePos == 300) {
+        // Проверяем контрольную сумму CRC-8 (сумма байтов 0..298 должна совпадать с байтом 299)
+        uint8_t crc = 0;
+        for (int j = 0; j < 299; j++) {
+          crc += frameBuf[j];
+        }
+        if (crc == frameBuf[299]) {
+          uint8_t fType = frameBuf[4];
+          if (fType == 0x01) {
+            parseJKSettingsFrame(frameBuf);
+          } else if (fType == 0x02) {
+            parseJKFrame(frameBuf);
+          }
+        }
+        framePos = 0;
       }
-      framePos = 0;
-      return;
     }
   }
 }
@@ -249,7 +323,6 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
 class ClientCallbacks : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* pCli) {
     bmsConnected = true;
-    pCli->updateConnParams(80, 160, 2, 400);
     Serial.println("JK BMS BLE Connected!");
   }
   void onDisconnect(NimBLEClient* pCli) {
@@ -292,26 +365,34 @@ bool queueBMSControl(const String& cmdName, int val) {
   if (cmdName == "chg") {
     pendingCmdReg = 0x1D; // Ключ Заряда (Charge MOS по BLE)
     pendingCmdVal = (val != 0) ? 1 : 0;
+    lastControlCmdMs = millis();
     hasPendingCmd = true;
     portENTER_CRITICAL(&bmsMux);
     bms.chg = (val != 0);
     portEXIT_CRITICAL(&bmsMux);
+    needImmediateCloudPublish = true;
     return true;
   } else if (cmdName == "dsg") {
     pendingCmdReg = 0x1E; // Ключ Разряда (Discharge MOS по BLE)
     pendingCmdVal = (val != 0) ? 1 : 0;
+    lastControlCmdMs = millis();
     hasPendingCmd = true;
     portENTER_CRITICAL(&bmsMux);
     bms.dsg = (val != 0);
     portEXIT_CRITICAL(&bmsMux);
+    needImmediateCloudPublish = true;
     return true;
   } else if (cmdName == "bal") {
     pendingCmdReg = 0x1F; // Балансировка (Balancer по BLE)
     pendingCmdVal = (val != 0) ? 1 : 0;
+    lastControlCmdMs = millis();
     hasPendingCmd = true;
+    settingsBalState = (val != 0);
+    hasSettingsFrame = true;
     portENTER_CRITICAL(&bmsMux);
     bms.bal = (val != 0);
     portEXIT_CRITICAL(&bmsMux);
+    needImmediateCloudPublish = true;
     return true;
   } else if (cmdName == "refresh") {
     pendingCmdReg = 0x96;
@@ -324,18 +405,21 @@ bool queueBMSControl(const String& cmdName, int val) {
     if (val == 0) {
       blePaused = true;
       blePausedAtMs = millis();
+      bmsConnected = false;
+      hasPendingCmd = false;
       Serial.println("[BLE CMD] Принудительное отключение BLE от BMS (освобождение для офиц. приложения)...");
     } else {
       blePaused = false;
       Serial.println("[BLE CMD] Возобновление BLE-соединения ESP32 с BMS...");
     }
+    needImmediateCloudPublish = true;
     return true;
   }
   return false;
 }
 
 bool connectToBMS() {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (blePaused || WiFi.status() != WL_CONNECTED) {
     return false;
   }
 
@@ -344,10 +428,17 @@ bool connectToBMS() {
   if (!pClient) {
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(&clientCB, false);
-    pClient->setConnectionParams(80, 160, 2, 400);
+    // Быстрые параметры во время установки связи и обнаружения сервисов FFE0 (без таймаута 520!)
+    pClient->setConnectionParams(12, 24, 0, 400);
+    pClient->setConnectTimeout(6);
   }
 
   if (pClient->isConnected()) {
+    if (blePaused) {
+      pClient->disconnect();
+      bmsConnected = false;
+      return false;
+    }
     bmsConnected = true;
     return true;
   }
@@ -356,14 +447,18 @@ bool connectToBMS() {
 
   NimBLEAddress addrPub(BMS_MAC, BLE_ADDR_PUBLIC);
   bool ok = pClient->connect(addrPub);
-  if (!ok) {
-    vTaskDelay(pdMS_TO_TICKS(300));
+  if (!ok && !blePaused) {
+    vTaskDelay(pdMS_TO_TICKS(250));
     NimBLEAddress addrRand(BMS_MAC, BLE_ADDR_RANDOM);
     ok = pClient->connect(addrRand);
   }
 
-  if (!ok) {
-    Serial.println("[BLE] Не удалось подключиться к BMS.");
+  if (!ok || blePaused) {
+    if (pClient->isConnected()) pClient->disconnect();
+    bmsConnected = false;
+    if (!blePaused) {
+      Serial.println("[BLE] Не удалось подключиться к BMS.");
+    }
     return false;
   }
 
@@ -371,6 +466,7 @@ bool connectToBMS() {
   if (!pSvc) {
     Serial.println("[BLE] Сервис FFE0 не найден!");
     pClient->disconnect();
+    bmsConnected = false;
     return false;
   }
 
@@ -378,6 +474,7 @@ bool connectToBMS() {
   if (!pNotifyChar) {
     Serial.println("[BLE] Характеристика FFE1 не найдена!");
     pClient->disconnect();
+    bmsConnected = false;
     return false;
   }
 
@@ -386,20 +483,24 @@ bool connectToBMS() {
     pWriteChar = pNotifyChar;
   }
 
+  framePos = 0;
   if (pNotifyChar->canNotify()) {
     pNotifyChar->subscribe(true, notifyCallback);
   }
 
   bmsConnected = true;
-  pClient->updateConnParams(80, 160, 2, 400);
 
   vTaskDelay(pdMS_TO_TICKS(250));
-  sendJKCommand(0x97, 0, 0);
+  sendJKCommand(0x97, 0, 0); // Запрос кадра настроек 0x01
   vTaskDelay(pdMS_TO_TICKS(350));
-  sendJKCommand(0x96, 0, 0);
+  sendJKCommand(0x96, 0, 0); // Запрос кадра ячеек 0x02
   lastParsedMs = millis();
 
-  Serial.println("[BLE] Канал открыт! Wi-Fi и BLE работают параллельно.");
+  // После успешного открытия потока ставим щадящий интервал без slave latency (чтобы не было разрывов 520)
+  pClient->updateConnParams(24, 48, 0, 400);
+
+  Serial.println("[BLE] Канал открыт! Wi-Fi и BLE работают стабильно.");
+  needImmediateCloudPublish = true;
   return true;
 }
 
@@ -409,7 +510,7 @@ String buildStatusJson() {
   snap = bms;
   portEXIT_CRITICAL(&bmsMux);
 
-  bool isFresh = bmsConnected && (snap.packets > 0) && ((millis() - snap.lastUpdateMs) < 25000);
+  bool isFresh = bmsConnected && !blePaused && (snap.packets > 0) && ((millis() - snap.lastUpdateMs) < 25000);
   float absPower = fabs(snap.power);
   float chgWatts = (snap.power > 0.0f) ? snap.power : 0.0f;
   float dsgWatts = (snap.power < 0.0f) ? fabs(snap.power) : 0.0f;
@@ -418,13 +519,13 @@ String buildStatusJson() {
   long ageSec = (snap.packets > 0) ? (long)((millis() - snap.lastUpdateMs) / 1000UL) : -1;
 
   String json;
-  json.reserve(950);
+  json.reserve(980);
   json += "{";
   json += "\"connected\":" + String((bmsConnected && !blePaused) ? "true" : "false") + ",";
   json += "\"blePaused\":" + String(blePaused ? "true" : "false") + ",";
   json += "\"hasData\":" + String((snap.packets > 0 && !blePaused) ? "true" : "false") + ",";
   json += "\"fresh\":" + String(isFresh ? "true" : "false") + ",";
-  String stTxt = blePaused ? "⏸ BLE отключен (свободен для офиц. приложения)" : (bmsConnected ? "Подключено (ESP32)" : "Поиск BMS по BLE...");
+  String stTxt = blePaused ? "⏸ BLE платы отключен (свободно для офиц. JK App)" : (bmsConnected ? "Подключено (ESP32)" : "Поиск BMS по BLE...");
   json += "\"statusText\":\"" + stTxt + "\",";
   json += "\"deviceName\":\"JK-B2A8S20P\",";
   json += "\"deviceAddress\":\"" + String(BMS_MAC) + "\",";
@@ -490,7 +591,6 @@ String buildStatusJson() {
 }
 
 // ==================== ВСТРОЕННЫЙ ЛЕГКОВЕСНЫЙ MQTT-КЛИЕНТ ====================
-// Работает поверх стандартного WiFiClient без установки сторонних библиотек!
 static void mqttWriteRemainingLength(uint8_t* buf, int& pos, int len) {
   do {
     uint8_t encoded = len % 128;
@@ -571,7 +671,7 @@ static void mqttPublishState(const String& json) {
 
   uint8_t hdr[64];
   int p = 0;
-  hdr[p++] = 0x31; // PUBLISH (QoS 0, RETAIN = 1, чтобы телефон сразу получал свежий статус!)
+  hdr[p++] = 0x31; // PUBLISH (QoS 0, RETAIN = 1)
   mqttWriteRemainingLength(hdr, p, remLen);
   hdr[p++] = (topLen >> 8) & 0xFF;
   hdr[p++] = topLen & 0xFF;
@@ -613,7 +713,7 @@ static void mqttPollIncoming() {
     if ((header & 0xF0) == 0x30 && toRead > 4) {
       int topLen = (buf[0] << 8) | buf[1];
       int payStart = 2 + topLen;
-      if ( (header & 0x06) != 0 ) payStart += 2; // если QoS > 0
+      if ((header & 0x06) != 0) payStart += 2; // если QoS > 0
       if (payStart < toRead) {
         buf[toRead] = 0;
         String msg = String((char*)&buf[payStart]);
@@ -647,8 +747,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <meta name="theme-color" content="#0b1120">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="JK BMS 24V">
-<title>JK BMS 24V 230Ah — Семейный Монитор</title>
+<meta name="apple-mobile-web-app-title" content="JK BMS Monitor">
+<title>JK BMS Monitor — 24V 230Ah</title>
 <style>
 :root{
   --bg:#0b1120;--card:#151f32;--border:#24324b;--text:#f1f5f9;--muted:#94a3b8;
@@ -737,8 +837,8 @@ body{
 <body>
   <div class="header">
     <div class="title-wrap">
-      <h1>LiFePO4 24V • 230Ah</h1>
-      <p id="subInfo">Шлюз ESP32 • JK-B2A8S20P</p>
+      <h1>JK BMS Monitor</h1>
+      <p id="subInfo">24V 230Ah • JK-B2A8S20P</p>
     </div>
     <div class="top-right">
       <div class="badge"><span class="dot" id="connDot"></span><span id="connTxt">Связь...</span></div>
@@ -750,7 +850,7 @@ body{
     <div style="font-size:.86rem;font-weight:800;margin-bottom:8px;color:var(--blue)">⚙️ Управление ключами JK BMS</div>
     <div class="ctrl-row">
       <span>Пароль управления (PIN):</span>
-      <input type="password" class="pin-in" id="pinIn" placeholder="PIN (1234)">
+      <input type="password" class="pin-in" id="pinIn" value="1234" placeholder="PIN (1234)">
     </div>
     <div class="ctrl-row">
       <span>⚡ Заряд (Charge MOS):</span>
@@ -771,6 +871,13 @@ body{
       <div>
         <button class="btn-sm" onclick="sendCmd('bal',1)">ВКЛ</button>
         <button class="btn-sm" style="background:#ef4444;color:#fff" onclick="sendCmd('bal',0)">ВЫКЛ</button>
+      </div>
+    </div>
+    <div class="ctrl-row">
+      <span>🔓 Связь платы с BMS (для офиц. JK App):</span>
+      <div>
+        <button class="btn-sm" style="background:#f59e0b;color:#000" onclick="sendCmd('ble',0)">Отключить</button>
+        <button class="btn-sm" style="background:#10b981;color:#000" onclick="sendCmd('ble',1)">Вернуть</button>
       </div>
     </div>
     <div id="cmdMsg" style="font-size:.75rem;color:var(--muted);margin-top:6px"></div>
@@ -850,8 +957,8 @@ async function sendCmd(cmd, val){
   try{
     const r = await fetch(`/control?pin=${encodeURIComponent(pin)}&cmd=${cmd}&val=${val}`);
     const t = await r.text();
-    msg.textContent = r.ok ? '✅ Команда принята BMS!' : ('❌ Ошибка: ' + t);
-    setTimeout(poll, 600);
+    msg.textContent = r.ok ? '✅ Команда принята платой!' : ('❌ Ошибка: ' + t);
+    setTimeout(poll, 500);
   }catch(e){
     msg.textContent = '❌ Ошибка соединения';
   }
@@ -877,7 +984,10 @@ async function poll(){
 
     const dot = document.getElementById('connDot');
     const txt = document.getElementById('connTxt');
-    if(d.connected || d.hasData){
+    if(d.blePaused){
+      dot.className = 'dot';
+      txt.textContent = '⏸ BLE отключен';
+    } else if(d.connected || d.hasData){
       dot.className = 'dot ok';
       txt.textContent = d.connected ? 'BMS Онлайн' : 'Обновление...';
     } else {
@@ -945,21 +1055,22 @@ setInterval(poll, 2000);
 )rawliteral";
 
 void bleTask(void* parameter) {
-  vTaskDelay(pdMS_TO_TICKS(2000));
+  vTaskDelay(pdMS_TO_TICKS(1500));
 
   for (;;) {
-    // Если пользователь нажал «Отключить ESP32 от BMS» (чтобы зайти с официального приложения JK BMS)
+    // 1. Если пользователь нажал «Отключить плату от BMS» (чтобы зайти с официального приложения JK BMS)
     if (blePaused) {
       if (pClient && pClient->isConnected()) {
         pClient->disconnect();
+        Serial.println("[BLE] Соединение с BMS разорвано по команде пользователя.");
       }
       bmsConnected = false;
-      // Страховочный авто-возврат через 15 минут, если забыли включить обратно
-      if (millis() - blePausedAtMs > 15UL * 60UL * 1000UL) {
+      // Страховочный авто-возврат через 20 минут, если забыли включить обратно
+      if (millis() - blePausedAtMs > 20UL * 60UL * 1000UL) {
         blePaused = false;
-        Serial.println("[BLE] Автоматическое возобновление связи с BMS после 15 мин паузы.");
+        Serial.println("[BLE] Автоматическое возобновление связи с BMS после 20 мин паузы.");
       }
-      vTaskDelay(pdMS_TO_TICKS(500));
+      vTaskDelay(pdMS_TO_TICKS(300));
       continue;
     }
 
@@ -969,9 +1080,13 @@ void bleTask(void* parameter) {
 
     if (!bmsConnected) {
       connectToBMS();
-      vTaskDelay(pdMS_TO_TICKS(5000));
+      // Вместо глухого 5-секундного ожидания проверяем blePaused каждые 250 мс
+      for (int w = 0; w < 16; w++) {
+        if (blePaused || bmsConnected) break;
+        vTaskDelay(pdMS_TO_TICKS(250));
+      }
     } else {
-      // Если пользователь нажал кнопку управления (Заряд/Разряд/Балансир) в приложении или на сайте
+      // Если пользователь переключил тумблер (Заряд / Разряд / Балансировка)
       if (hasPendingCmd) {
         uint8_t reg = pendingCmdReg;
         uint32_t val = pendingCmdVal;
@@ -982,16 +1097,19 @@ void bleTask(void* parameter) {
           Serial.printf("[BLE CMD] Запись регистра 0x%02X = %u\n", reg, (unsigned int)val);
           sendJKCommand(reg, val, 4);
           vTaskDelay(pdMS_TO_TICKS(350));
-          sendJKCommand(0x96, 0, 0);
+          sendJKCommand(0x97, 0, 0); // Запрашиваем обновленный кадр настроек 0x01
+          vTaskDelay(pdMS_TO_TICKS(350));
+          sendJKCommand(0x96, 0, 0); // Запрашиваем обновленный кадр ячеек 0x02
         }
-        lastParsedMs = 0;
+        lastParsedMs = millis();
+        needImmediateCloudPublish = true;
       }
 
-      if (millis() - lastParsedMs > 25000) {
+      if (millis() - lastParsedMs > 20000UL) {
         sendJKCommand(0x96, 0, 0);
         lastParsedMs = millis();
       }
-      vTaskDelay(pdMS_TO_TICKS(250));
+      vTaskDelay(pdMS_TO_TICKS(200));
     }
   }
 }
@@ -1000,7 +1118,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n==========================================");
-  Serial.println("  Запуск шлюза ESP32 JK-BMS v2.0 (Cloud)");
+  Serial.println("  Запуск шлюза ESP32 JK-BMS v2.2 (Cloud)");
   Serial.println("==========================================");
 
   WiFi.mode(WIFI_STA);
@@ -1096,8 +1214,9 @@ void loop() {
 
   unsigned long now = millis();
 
-  // Облачная синхронизация каждые 3 секунды (для доступа к приложению из любой точки мира!)
-  if (WiFi.status() == WL_CONNECTED && (now - lastCloudSync >= 3000)) {
+  // Облачная синхронизация каждые 3 секунды или мгновенно после команды управления
+  if (WiFi.status() == WL_CONNECTED && (needImmediateCloudPublish || (now - lastCloudSync >= 3000))) {
+    needImmediateCloudPublish = false;
     lastCloudSync = now;
     if (mqttConnectAndSubscribe()) {
       mqttPublishState(buildStatusJson());
@@ -1107,10 +1226,11 @@ void loop() {
   if (now - lastStatusPrint >= 5000) {
     lastStatusPrint = now;
     if (WiFi.status() == WL_CONNECTED) {
+      const char* bleStat = blePaused ? "ПАУЗА" : (bmsConnected ? "OK" : "ПОИСК");
       Serial.printf("[STATUS] WiFi: OK (%s) | Cloud: %s | BLE: %s | SOC: %d%% | V: %.2fV | Кадров: %u\n",
                     WiFi.localIP().toString().c_str(),
                     mqttNet.connected() ? "OK" : "RECONN",
-                    bmsConnected ? "OK" : "ПОИСК",
+                    bleStat,
                     bms.soc,
                     bms.totalVoltage,
                     bms.packets);

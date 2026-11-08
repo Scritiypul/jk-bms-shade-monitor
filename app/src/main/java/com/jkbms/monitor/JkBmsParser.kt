@@ -33,7 +33,7 @@ data class JkBmsState(
     val maxCellIndex: Int = 0,             // Индекс максимальной ячейки (1..8)
     val chargeMosEnabled: Boolean = true,
     val dischargeMosEnabled: Boolean = true,
-    val balanceEnabled: Boolean = false,
+    val balanceEnabled: Boolean = true,
     val cycleCount: Int = 0,
     val packetsCount: Long = 0L,
     val gatewayIp: String = "",
@@ -64,6 +64,8 @@ data class JkBmsState(
 }
 
 object JkBmsParser {
+    private const val PADDING_PATTERN_U32 = 0x54412E51L // "Q.AT" = 1413548625 (1413548.625)
+
     fun buildDeviceInfoCommand(): ByteArray = buildCommand(0x97.toByte(), 0, 0)
     fun buildCellInfoCommand(): ByteArray = buildCommand(0x96.toByte(), 0, 0)
 
@@ -92,44 +94,20 @@ object JkBmsParser {
 
     /**
      * Разбор JSON-ответа от шлюза ESP32 (/status или из облачного MQTT-канала)
+     * Включает жесткую фильтрацию на случай, если на ESP32 еще старая прошивка v2.0 или в MQTT остался старый пакет.
      */
     fun parseGatewayJson(jsonStr: String, sourceLabel: String): JkBmsState? {
         return try {
             val obj = JSONObject(jsonStr)
             val espBlePaused = obj.optBoolean("blePaused", false)
             val isConn = !espBlePaused && (obj.optBoolean("connected", false) || obj.optBoolean("hasData", false))
-            val soc = obj.optInt("soc", obj.optInt("socPercent", 0)).coerceIn(0, 100)
-            val totalV = obj.optDouble("totalVoltage", obj.optDouble("packVoltage", 0.0))
-            val curA = obj.optDouble("current", obj.optDouble("currentAmps", 0.0))
-            val signedPwr = totalV * curA
-            val chgW = if (signedPwr > 0.0) signedPwr else 0.0
-            val dsgW = if (signedPwr < 0.0) abs(signedPwr) else 0.0
-
-            val remAh = obj.optDouble("remainCap", obj.optDouble("remainingCapacityAh", 0.0))
-            val nomAh = obj.optDouble("nominalCap", obj.optDouble("nominalCapacityAh", 230.0))
-            val remWh = obj.optDouble(
-                "remainingEnergyWh",
-                remAh * (if (totalV > 1.0) totalV else 25.6)
-            )
-
-            val tMos = obj.optDouble("tempMos", 0.0)
-            val t1 = obj.optDouble("temp1", obj.optDouble("tempSensor1", 0.0))
-            val t2 = obj.optDouble("temp2", obj.optDouble("tempSensor2", 0.0))
-
-            val chgMos = obj.optBoolean("chg", obj.optBoolean("chargeMosEnabled", true))
-            val dsgMos = obj.optBoolean("dsg", obj.optBoolean("dischargeMosEnabled", true))
-            val bal = obj.optBoolean("bal", obj.optBoolean("balanceEnabled", false))
-            val cycles = obj.optInt("cycleCount", 0)
-            val packets = obj.optLong("packets", 0L)
-            val gwIp = obj.optString("ip", obj.optString("phoneIp", ""))
-            val rssi = obj.optInt("rssi", 0)
 
             val cellsArr = obj.optJSONArray("cells") ?: obj.optJSONArray("cellVoltages")
             val cells = mutableListOf<Double>()
             if (cellsArr != null) {
                 for (i in 0 until cellsArr.length()) {
                     val v = cellsArr.optDouble(i, 0.0)
-                    if (v > 0.1) cells.add(v)
+                    if (v in 1.0..5.0) cells.add(v)
                 }
             }
 
@@ -152,12 +130,63 @@ object JkBmsParser {
                     sumV += v
                 }
             }
+
             val avgV = if (cells.isNotEmpty()) sumV / cells.size else obj.optDouble("cellAvg", 0.0)
             val deltaMv = if (cells.size >= 2) {
                 ((maxV - minV) * 1000.0).roundToInt()
             } else {
-                obj.optInt("cellDeltaMv", 0)
+                obj.optInt("cellDeltaMv", 0).coerceIn(0, 2000)
             }
+
+            val rawTotalV = obj.optDouble("totalVoltage", obj.optDouble("packVoltage", 0.0))
+            val rawCurA = obj.optDouble("current", obj.optDouble("currentAmps", 0.0))
+
+            // Если в пакете старой прошивки ESP32 пришел мусорный хвост 1413548.63 ("Q.AT")
+            val isCorruptedFrame = rawTotalV > 60.0 || abs(rawCurA) > 400.0 ||
+                (sumV > 10.0 && abs(rawTotalV - sumV) > 4.0)
+
+            val totalV = if (!isCorruptedFrame && rawTotalV in 8.0..45.0) {
+                rawTotalV
+            } else if (sumV > 8.0) {
+                sumV
+            } else {
+                0.0
+            }
+
+            val curA = if (!isCorruptedFrame && abs(rawCurA) <= 350.0) rawCurA else 0.0
+            val signedPwr = totalV * curA
+            val chgW = if (signedPwr > 0.0) signedPwr else 0.0
+            val dsgW = if (signedPwr < 0.0) abs(signedPwr) else 0.0
+
+            val rawSoc = obj.optInt("soc", obj.optInt("socPercent", 0)).coerceIn(0, 100)
+            val rawNomAh = obj.optDouble("nominalCap", obj.optDouble("nominalCapacityAh", 230.0))
+            val nomAh = if (!isCorruptedFrame && rawNomAh in 10.0..1000.0) rawNomAh else 230.0
+
+            val rawRemAh = obj.optDouble("remainCap", obj.optDouble("remainingCapacityAh", 0.0))
+            val remAh = if (!isCorruptedFrame && rawRemAh in 0.0..(nomAh * 1.1)) {
+                rawRemAh
+            } else {
+                nomAh * (rawSoc / 100.0)
+            }
+
+            val remWh = remAh * (if (totalV > 8.0) totalV else 25.6)
+
+            val rawTMos = obj.optDouble("tempMos", 0.0)
+            val rawT1 = obj.optDouble("temp1", obj.optDouble("tempSensor1", 0.0))
+            val rawT2 = obj.optDouble("temp2", obj.optDouble("tempSensor2", 0.0))
+
+            val tMos = if (!isCorruptedFrame && rawTMos in -40.0..130.0) rawTMos else 25.0
+            val t1 = if (!isCorruptedFrame && rawT1 in -40.0..130.0) rawT1 else 24.0
+            val t2 = if (!isCorruptedFrame && rawT2 in -40.0..130.0) rawT2 else 24.0
+
+            val chgMos = obj.optBoolean("chg", obj.optBoolean("chargeMosEnabled", true))
+            val dsgMos = obj.optBoolean("dsg", obj.optBoolean("dischargeMosEnabled", true))
+            val bal = obj.optBoolean("bal", obj.optBoolean("balanceEnabled", true))
+            val rawCycles = obj.optInt("cycleCount", 0)
+            val cycles = if (!isCorruptedFrame && rawCycles in 0..50000) rawCycles else 0
+            val packets = obj.optLong("packets", 0L)
+            val gwIp = obj.optString("ip", obj.optString("phoneIp", ""))
+            val rssi = obj.optInt("rssi", 0)
 
             val statusLabel = when {
                 espBlePaused -> "⏸ BLE платы отключен (свободно для офиц. JK App)"
@@ -173,14 +202,14 @@ object JkBmsParser {
                 connectionSource = sourceLabel,
                 deviceName = obj.optString("deviceName", "JK-B2A8S20P"),
                 deviceAddress = obj.optString("bmsMac", "C8:47:80:55:04:85"),
-                socPercent = soc,
+                socPercent = rawSoc,
                 packVoltage = totalV,
                 currentAmps = curA,
                 powerWatts = signedPwr,
                 chargeWatts = chgW,
                 dischargeWatts = dsgW,
                 remainingCapacityAh = remAh,
-                nominalCapacityAh = if (nomAh > 1.0) nomAh else 230.0,
+                nominalCapacityAh = nomAh,
                 remainingEnergyWh = remWh,
                 tempMos = tMos,
                 tempSensor1 = t1,
@@ -205,7 +234,7 @@ object JkBmsParser {
     }
 
     /**
-     * Разбор 300-байтного кадра телеметрии (тип 0x02) при прямом BLE-подключении
+     * Разбор 300-байтного кадра телеметрии (тип 0x01 или 0x02) при прямом BLE-подключении
      */
     fun parseTelemetryFrame(frame: ByteArray, currentState: JkBmsState): JkBmsState? {
         if (frame.size < 250) return null
@@ -217,21 +246,48 @@ object JkBmsParser {
             return null
         }
 
-        val frameType = frame[4].toInt() and 0xFF
-        if (frameType != 0x02) return null
+        // Проверка CRC-8 если кадр полный (300 байт)
+        if (frame.size >= 300) {
+            var crc = 0
+            for (i in 0 until 299) {
+                crc = (crc + (frame[i].toInt() and 0xFF)) and 0xFF
+            }
+            val expected = frame[299].toInt() and 0xFF
+            if (crc != expected) return null
+        }
 
+        val frameType = frame[4].toInt() and 0xFF
         val buf = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN)
 
+        // Кадр настроек 0x01: точное состояние переключателей Заряд / Разряд / Балансировка
+        if (frameType == 0x01) {
+            val rawChg = buf.getInt(118).toLong() and 0xFFFFFFFFL
+            val rawDsg = buf.getInt(122).toLong() and 0xFFFFFFFFL
+            val rawBal = buf.getInt(126).toLong() and 0xFFFFFFFFL
+            if (rawChg <= 1L && rawDsg <= 1L && rawBal <= 1L) {
+                return currentState.copy(
+                    chargeMosEnabled = rawChg != 0L,
+                    dischargeMosEnabled = rawDsg != 0L,
+                    balanceEnabled = rawBal != 0L
+                )
+            }
+            return null
+        }
+
+        if (frameType != 0x02) return null
+
         val cells = mutableListOf<Double>()
-        for (i in 0 until 24) {
+        for (i in 0 until 8) {
             val offset = 6 + i * 2
             if (offset + 2 <= frame.size) {
                 val mv = buf.getShort(offset).toInt() and 0xFFFF
-                if (mv in 500..5500) {
+                if (mv in 1500..4500) {
                     cells.add(mv / 1000.0)
                 }
             }
         }
+
+        if (cells.size < 4) return null
 
         var minV = 99.0
         var maxV = 0.0
@@ -243,45 +299,65 @@ object JkBmsParser {
             if (v > maxV) { maxV = v; maxIdx = i + 1 }
         }
 
-        val deltaMv = if (cells.size >= 2) {
-            ((maxV - minV) * 1000.0).roundToInt()
-        } else {
-            val rawDelta = buf.getShort(62).toInt() and 0xFFFF
-            if (rawDelta in 0..2000) rawDelta else 0
-        }
-        val avgV = if (cells.isNotEmpty()) cells.sum() / cells.size else 0.0
+        val cellsSum = cells.sum()
+        val deltaMv = ((maxV - minV) * 1000.0).roundToInt()
+        val avgV = cellsSum / cells.size
 
-        val shift = detectOffsetShift(buf, cells.sum())
+        val shift = detectOffsetShift(buf, cellsSum)
 
         val rawVoltage = buf.getInt(118 + shift).toLong() and 0xFFFFFFFFL
-        val packVoltage = rawVoltage / 1000.0
+        val rawCurrentU32 = buf.getInt(126 + shift).toLong() and 0xFFFFFFFFL
+        if (rawVoltage == PADDING_PATTERN_U32 || rawCurrentU32 == PADDING_PATTERN_U32) {
+            return null
+        }
 
-        val rawCurrent = buf.getInt(126 + shift)
-        val currentAmps = rawCurrent / 1000.0
+        val packVoltage = rawVoltage / 1000.0
+        if (packVoltage !in 10.0..42.0 || abs(packVoltage - cellsSum) > 3.5) {
+            return null
+        }
+
+        val currentAmps = buf.getInt(126 + shift) / 1000.0
+        if (abs(currentAmps) > 350.0) {
+            return null
+        }
 
         val tempT1 = readTemperature(buf, 130 + shift)
         val tempT2 = readTemperature(buf, 132 + shift)
         val tempMos = readTemperature(buf, if (shift == 0) 134 else 112 + shift)
 
-        val soc = (frame[141 + shift].toInt() and 0xFF).coerceIn(0, 100)
+        val rawSoc = frame[141 + shift].toInt() and 0xFF
+        if (rawSoc > 100) return null
+        val soc = rawSoc.coerceIn(0, 100)
 
         val remCapMah = buf.getInt(142 + shift).toLong() and 0xFFFFFFFFL
         val nomCapMah = buf.getInt(146 + shift).toLong() and 0xFFFFFFFFL
-        val remCapAh = remCapMah / 1000.0
-        val nomCapAh = nomCapMah / 1000.0
+        val nomCapAh = if (nomCapMah != PADDING_PATTERN_U32 && nomCapMah in 5000L..1000000L) {
+            nomCapMah / 1000.0
+        } else {
+            230.0
+        }
+        val remCapAh = if (remCapMah != PADDING_PATTERN_U32 && remCapMah <= 1000000L) {
+            (remCapMah / 1000.0).coerceAtMost(nomCapAh * 1.1)
+        } else {
+            nomCapAh * (soc / 100.0)
+        }
 
-        val cycleCount = buf.getInt(150 + shift).coerceAtLeast(0)
+        val rawCycles = buf.getInt(150 + shift).toLong() and 0xFFFFFFFFL
+        val cycleCount = if (rawCycles != PADDING_PATTERN_U32 && rawCycles in 0L..50000L) {
+            rawCycles.toInt()
+        } else {
+            0
+        }
 
-        val chargeMos = (frame.getOrNull(166 + shift)?.toInt() ?: 1) != 0
-        val dischargeMos = (frame.getOrNull(167 + shift)?.toInt() ?: 1) != 0
-        val balanceActive = (frame.getOrNull(140 + shift)?.toInt() ?: 0) != 0
+        val rawChgByte = frame.getOrNull(166 + shift)?.toInt()?.and(0xFF) ?: 255
+        val rawDsgByte = frame.getOrNull(167 + shift)?.toInt()?.and(0xFF) ?: 255
+        val chargeMos = if (rawChgByte <= 1) (rawChgByte != 0) else currentState.chargeMosEnabled
+        val dischargeMos = if (rawDsgByte <= 1) (rawDsgByte != 0) else currentState.dischargeMosEnabled
 
         val powerW = packVoltage * currentAmps
         val chargeW = if (powerW > 0.0) powerW else 0.0
         val dischargeW = if (powerW < 0.0) abs(powerW) else 0.0
-
-        val nominalPackV = if (cells.isNotEmpty()) cells.size * 3.2 else packVoltage
-        val remEnergyWh = remCapAh * (if (packVoltage > 1.0) packVoltage else nominalPackV)
+        val remEnergyWh = remCapAh * packVoltage
 
         return currentState.copy(
             connected = true,
@@ -294,7 +370,7 @@ object JkBmsParser {
             chargeWatts = chargeW,
             dischargeWatts = dischargeW,
             remainingCapacityAh = remCapAh,
-            nominalCapacityAh = if (nomCapAh > 1.0) nomCapAh else 230.0,
+            nominalCapacityAh = nomCapAh,
             remainingEnergyWh = remEnergyWh,
             tempMos = tempMos,
             tempSensor1 = tempT1,
@@ -306,7 +382,6 @@ object JkBmsParser {
             maxCellIndex = maxIdx,
             chargeMosEnabled = chargeMos,
             dischargeMosEnabled = dischargeMos,
-            balanceEnabled = balanceActive,
             cycleCount = cycleCount,
             packetsCount = currentState.packetsCount + 1,
             lastUpdatedMillis = System.currentTimeMillis()
@@ -314,20 +389,25 @@ object JkBmsParser {
     }
 
     private fun detectOffsetShift(buf: ByteBuffer, cellsVoltageSum: Double): Int {
-        val v0 = (buf.getInt(118).toLong() and 0xFFFFFFFFL) / 1000.0
+        val rawV0 = buf.getInt(118).toLong() and 0xFFFFFFFFL
+        val rawV32 = buf.getInt(150).toLong() and 0xFFFFFFFFL
+        if (rawV32 == PADDING_PATTERN_U32) return 0
+        if (rawV0 == PADDING_PATTERN_U32) return 32
+
+        val v0 = rawV0 / 1000.0
         val soc0 = buf.get(141).toInt() and 0xFF
 
-        val v32 = (buf.getInt(150).toLong() and 0xFFFFFFFFL) / 1000.0
+        val v32 = rawV32 / 1000.0
         val soc32 = buf.get(173).toInt() and 0xFF
 
-        if (cellsVoltageSum > 3.0) {
+        if (cellsVoltageSum > 8.0) {
             val diff0 = abs(v0 - cellsVoltageSum)
             val diff32 = abs(v32 - cellsVoltageSum)
             if (diff0 < 2.5 && soc0 in 0..100) return 0
             if (diff32 < 2.5 && soc32 in 0..100) return 32
         }
-        if (v0 in 5.0..100.0 && soc0 in 0..100) return 0
-        if (v32 in 5.0..100.0 && soc32 in 0..100) return 32
+        if (v0 in 10.0..45.0 && soc0 in 0..100) return 0
+        if (v32 in 10.0..45.0 && soc32 in 0..100) return 32
         return 0
     }
 
@@ -335,6 +415,6 @@ object JkBmsParser {
         if (offset + 2 > buf.limit()) return 0.0
         val raw = buf.getShort(offset).toInt()
         val temp = raw / 10.0
-        return if (temp in -50.0..150.0) temp else 0.0
+        return if (temp in -45.0..130.0) temp else 0.0
     }
 }

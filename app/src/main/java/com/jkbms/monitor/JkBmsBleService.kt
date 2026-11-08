@@ -115,8 +115,14 @@ class JkBmsBleService : Service() {
             val host = prefs.esp32Host.ifBlank { "192.168.123.105" }
             val topicId = prefs.cloudTopicId.ifBlank { "c84780550485" }
 
-            // 0. Если активно прямое BLE-соединение с телефона на BMS
+            // 0. Если пользователь нажал кнопку освобождения BLE для официального JK App —
+            // на всякий случай отключаем и прямой BLE на самом телефоне, если он был включен
             val svc = activeInstance
+            if (cmd == "ble" && value == 0) {
+                svc?.disconnectGatt()
+            }
+
+            // Если активно прямое BLE-соединение с телефона на BMS
             if (prefs.useDirectBle && svc != null && svc.isGattConnected) {
                 val regByte: Byte? = when (cmd) {
                     "chg" -> 0x1D.toByte()
@@ -319,6 +325,8 @@ class JkBmsBleService : Service() {
     private var lastConnectAttemptMillis = 0L
     @Volatile
     private var lastLocalWifiSuccessMillis = 0L
+    @Volatile
+    private var lastControlActionMillis = 0L
     private var lastNotificationUpdateMillis = 0L
 
     private val rxBuffer = ByteArrayOutputStream()
@@ -405,6 +413,7 @@ class JkBmsBleService : Service() {
     }
 
     fun applyOptimisticControl(cmd: String, value: Int) {
+        lastControlActionMillis = System.currentTimeMillis()
         val cur = _stateFlow.value
         val enabled = value != 0
         val updated = when (cmd) {
@@ -427,6 +436,30 @@ class JkBmsBleService : Service() {
             else -> cur
         }
         updateState(updated)
+    }
+
+    private fun updateStateFromGateway(parsed: JkBmsState) {
+        val now = System.currentTimeMillis()
+        val cur = _stateFlow.value
+        // В течение 4.5 сек после ручного переключения тумблера не даем старым пакетам вернуть тумблер назад
+        val merged = if (now - lastControlActionMillis < 4500L) {
+            parsed.copy(
+                chargeMosEnabled = cur.chargeMosEnabled,
+                dischargeMosEnabled = cur.dischargeMosEnabled,
+                balanceEnabled = cur.balanceEnabled,
+                paused = cur.paused,
+                blePausedOnEsp = cur.blePausedOnEsp,
+                connected = if (cur.blePausedOnEsp) false else parsed.connected,
+                statusText = if (cur.blePausedOnEsp) {
+                    "⏸ BLE платы отключен (свободно для офиц. JK App)"
+                } else {
+                    parsed.statusText
+                }
+            )
+        } else {
+            parsed
+        }
+        updateState(merged)
     }
 
     fun sendBleControlRegister(reg: Byte, value: Int) {
@@ -471,7 +504,7 @@ class JkBmsBleService : Service() {
                             val parsed = JkBmsParser.parseGatewayJson(json, "🏠 Дома Wi-Fi ($host)")
                             if (parsed != null) {
                                 lastLocalWifiSuccessMillis = System.currentTimeMillis()
-                                updateState(parsed)
+                                updateStateFromGateway(parsed)
                                 checkOptionalAlerts(parsed)
                             }
                         }
@@ -573,7 +606,7 @@ class JkBmsBleService : Service() {
                                     if (System.currentTimeMillis() - lastLocalWifiSuccessMillis > 3500L) {
                                         val parsed = JkBmsParser.parseGatewayJson(jsonStr, "🌍 Интернет (Облако)")
                                         if (parsed != null) {
-                                            updateState(parsed)
+                                            updateStateFromGateway(parsed)
                                             checkOptionalAlerts(parsed)
                                         }
                                     }
