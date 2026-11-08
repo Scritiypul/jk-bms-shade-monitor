@@ -112,7 +112,10 @@ class MainActivity : AppCompatActivity() {
         super.onStart()
         uiJob = mainScope.launch {
             JkBmsBleService.stateFlow.collect { state ->
-                renderState(state)
+                try {
+                    renderState(state)
+                } catch (_: Throwable) {
+                }
             }
         }
     }
@@ -973,10 +976,15 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, JkBmsBleService::class.java).apply {
             this.action = action
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
+        try {
             startService(intent)
+        } catch (_: Throwable) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                }
+            } catch (_: Throwable) {
+            }
         }
     }
 

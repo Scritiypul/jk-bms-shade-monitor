@@ -10,9 +10,9 @@ android {
     defaultConfig {
         applicationId = "com.jkbms.monitor"
         minSdk = 26
-        targetSdk = 34
-        versionCode = 2
-        versionName = "2.0.0"
+        targetSdk = 33
+        versionCode = 3
+        versionName = "2.0.1"
     }
 
     buildTypes {

@@ -16,6 +16,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
@@ -229,9 +230,29 @@ class JkBmsBleService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
-        startForeground(NOTIF_ID_MONITOR, buildShadeNotification(_stateFlow.value))
+        promoteToForegroundSafely()
         startHybridGatewayLoops()
         startBlePollingLoop()
+    }
+
+    private fun promoteToForegroundSafely() {
+        try {
+            val notif = buildShadeNotification(_stateFlow.value)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIF_ID_MONITOR,
+                    notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIF_ID_MONITOR, notif)
+            }
+        } catch (_: Throwable) {
+            try {
+                startForeground(NOTIF_ID_MONITOR, buildShadeNotification(_stateFlow.value))
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -643,8 +664,11 @@ class JkBmsBleService : Service() {
             prev.statusText != newState.statusText
         if (statusChanged || now - lastNotificationUpdateMillis >= 1500L) {
             lastNotificationUpdateMillis = now
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify(NOTIF_ID_MONITOR, buildShadeNotification(newState))
+            try {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(NOTIF_ID_MONITOR, buildShadeNotification(newState))
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -666,15 +690,18 @@ class JkBmsBleService : Service() {
 
         if (reason != null) {
             lastAlertTimeMillis = now
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val alertNotif = NotificationCompat.Builder(this, CHANNEL_ID_ALERTS)
-                .setSmallIcon(android.R.drawable.stat_sys_warning)
-                .setContentTitle("⚠️ Внимание: JK BMS")
-                .setContentText(reason)
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setAutoCancel(true)
-                .build()
-            nm.notify(NOTIF_ID_ALERT, alertNotif)
+            try {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                val alertNotif = NotificationCompat.Builder(this, CHANNEL_ID_ALERTS)
+                    .setSmallIcon(android.R.drawable.stat_sys_warning)
+                    .setContentTitle("⚠️ Внимание: JK BMS")
+                    .setContentText(reason)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .build()
+                nm.notify(NOTIF_ID_ALERT, alertNotif)
+            } catch (_: Throwable) {
+            }
         }
     }
 
